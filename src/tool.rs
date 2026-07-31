@@ -70,6 +70,7 @@ static CALL_TOOL_FN: &str = "callTool";
     text_config(name = CONFIG_SCRIPT),
     integer_config(name = CONFIG_TIME_LIMIT_MS, default = DEFAULT_TIME_LIMIT_MS, detail),
     integer_config(name = CONFIG_MEMORY_LIMIT_MB, default = DEFAULT_MEMORY_LIMIT_MB, detail),
+    hint(height = 2),
 )]
 struct ZcToolAgent {
     data: AgentData,

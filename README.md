@@ -268,7 +268,7 @@ Each run confines the VM to a single `spawn_blocking` closure. When the script c
 
 ## Key Dependencies
 
-- [zapcode](https://github.com/TheUncharted/zapcode) — Rust-native sandboxed TypeScript-subset interpreter (git dependency pinned to a tag; crates.io lags behind the repository)
+- [zapcode](https://github.com/TheUncharted/zapcode) — Rust-native sandboxed TypeScript-subset interpreter
 
 ## License
 
