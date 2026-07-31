@@ -4,10 +4,10 @@ Execute sandboxed TypeScript-subset scripts in Modular Agent using [TheUncharted
 
 ## Features
 
-- **ZapCode Script** — Run TypeScript-like scripts to transform, filter, and reshape data in agent workflows
-- **ZapCode Code Runner** — Execute LLM-generated code with access to registered tools (code-mode)
-- **ZapCode Tool** — Define an LLM tool whose implementation is a script
-- **ZapCode Custom Agent** — A generic node whose ports, configs, and behavior are declared by a script
+- **ZC Expr** — Run TypeScript-like expressions and scripts to transform, filter, and reshape data in agent workflows
+- **ZC Runner** — Execute LLM-generated code with access to registered tools (code-mode)
+- **ZC Tool** — Define an LLM tool whose implementation is a script
+- **ZC Script** — A generic node whose ports, configs, and behavior are declared by a script
 
 ## Installation
 
@@ -26,9 +26,9 @@ Two changes to add this package to [`modular-agent-desktop`](https://github.com/
    use modular_agent_zapcode;
    ```
 
-## ZapCode Script
+## ZC Expr
 
-Executes user-provided scripts through the ZapCode interpreter. Scripts receive input as the variable `value` and the value of the last expression becomes the output. Scripts are compiled fresh on each invocation; an empty script is a silent no-op.
+Evaluates user-provided expressions and scripts through the ZapCode interpreter. Scripts receive input as the variable `value` and the value of the last expression becomes the output. Scripts are compiled fresh on each invocation; an empty script is a silent no-op.
 
 Scripts can call any registered tool with `await callTool(name, args)`; a failed tool call aborts the script with an error. `console.log` output is written to the application log, tagged with the agent id (output after the first `callTool` is not captured).
 
@@ -36,7 +36,7 @@ Scripts can call any registered tool with `await callTool(name, args)`; a failed
 
 | Config | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| script | text | "" | TypeScript-like script to execute. Empty script produces no output (silent no-op) |
+| expr | text | "" | TypeScript-like expression or script to evaluate. Empty script produces no output (silent no-op) |
 | skip_unit | boolean | false | When true, suppress output if the script results in `undefined` or `null` |
 | time_limit_ms | integer | 5000 | Time limit for each stretch of script execution between `callTool` calls |
 | memory_limit_mb | integer | 32 | Script memory limit in megabytes |
@@ -79,7 +79,7 @@ const r = await callTool("web-search", { query: value });
 r
 ```
 
-## ZapCode Code Runner
+## ZC Runner
 
 Executes LLM-generated TypeScript code with access to registered tools — the code-mode counterpart of giving an LLM individual tools. Send generated code, as a string or a message whose text is the code, to the `script` port. The value of the last expression is emitted on `value`.
 
@@ -109,20 +109,20 @@ Every selected tool — including names that are not valid identifiers, such as 
 
 ### Self-Correction Flow
 
-Compile and runtime errors fail the run and flow out of the node's `err` port. Wiring that port back into the chat agent turns the Code Runner into a self-correcting loop:
+Compile and runtime errors fail the run and flow out of the node's `err` port. Wiring that port back into the chat agent turns the ZC Runner into a self-correcting loop:
 
 ```
-Chat (LLM) ──message──▶ Code Runner ──value──▶ downstream / back to chat
+Chat (LLM) ──message──▶ ZC Runner ──value──▶ downstream / back to chat
     ▲                       │
     └──────── err ──────────┘
 ```
 
 1. The chat agent is prompted to answer with a single ts-tagged code fence.
-2. The Code Runner strips the fence and executes the code, dispatching tool calls.
+2. The ZC Runner strips the fence and executes the code, dispatching tool calls.
 3. On failure, the error text (e.g. `ZapCode compile error: …`) flows from `err` back into the chat agent; the LLM sees its own error, fixes the code, and retries.
 4. On success, `value` carries the result onward.
 
-## ZapCode Tool
+## ZC Tool
 
 Defines an LLM tool implemented as a script. While the agent is running, the tool is registered under `name` so LLM agents whose `tools` patterns match it can call it.
 
@@ -158,7 +158,7 @@ a + b
 
 a call with `{"a": 1, "b": 2}` returns `3`.
 
-## ZapCode Custom Agent
+## ZC Script
 
 A generic node whose ports, configs, and behavior are defined by a script. The script declares the node's shape in a top-level `AGENT` object and implements its behavior in an `onInput(port, value)` function (the name `process` is reserved by the sandbox):
 
@@ -233,7 +233,7 @@ All four agents share the same value bridge.
 
 | ZapCode Type | AgentValue | Notes |
 | ------------ | ---------- | ----- |
-| undefined, null | Unit | Suppressed when `skip_unit` is true (ZapCode Script) |
+| undefined, null | Unit | Suppressed when `skip_unit` is true (ZC Expr) |
 | boolean | Boolean | |
 | int | Integer | |
 | float | Number | |
@@ -251,15 +251,15 @@ ZapCode is a sandboxed interpreter for a subset of TypeScript — not Node, not 
 - Subset language: see the [zapcode repository](https://github.com/TheUncharted/zapcode) for supported features
 - The spread operator (`...`) is not implemented, and it fails silently: `[...xs, y]` produces the nested array `[xs, y]` instead of spreading (object spread and spread call arguments also misbehave). Use `xs.concat([y])` instead
 - No `import`, `require`, or `eval` — no module system and no dynamic code loading
-- No filesystem, network, or environment access; the only doors out of the sandbox are the host functions each agent declares (`callTool`, and for the Custom Agent `emit` / `getConfig` / `getState` / `setState` / `log`)
+- No filesystem, network, or environment access; the only doors out of the sandbox are the host functions each agent declares (`callTool`, and for the ZC Script agent `emit` / `getConfig` / `getState` / `setState` / `log`)
 - Resource limits: execution stops with an error when the time limit (`time_limit_ms`, wall clock) or memory limit (`memory_limit_mb`) is exceeded. The time limit applies to each stretch of script execution between host calls, so it does not bound the total duration of a run that makes tool calls
 - `console.log` capture stops at the first tool call; later output is lost
-- Tool-from-tool recursion is not guarded (see ZapCode Tool)
+- Tool-from-tool recursion is not guarded (see ZC Tool)
 
 ## Error Handling
 
 - **Compile errors** (`ZapCode compile error: …`) and **runtime errors** (`ZapCode runtime error: …`) fail the agent's `process()` and flow out of the node's `err` port.
-- **ZapCode Tool** is the exception: its script errors become error tool results, which are returned to the calling LLM instead of failing the flow.
+- **ZC Tool** is the exception: its script errors become error tool results, which are returned to the calling LLM instead of failing the flow.
 - A **failed tool call** inside a script (`callTool` or a direct tool function) aborts the script with the tool's error.
 
 ## Architecture

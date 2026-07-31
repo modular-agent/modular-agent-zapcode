@@ -5,7 +5,7 @@ use modular_agent_core::{
 };
 use zapcode_core::ResourceLimits;
 
-use crate::runner::{ExternalHandler, run_zapcode};
+use crate::bridge::{ExternalHandler, run_zapcode};
 
 static CATEGORY: &str = "Script/ZapCode";
 
@@ -62,7 +62,7 @@ static CALL_TOOL_FN: &str = "callTool";
 /// With `parameters` declaring properties `a` and `b` and the script `a + b`,
 /// a call with `{"a": 1, "b": 2}` returns `3`.
 #[modular_agent(
-    title = "ZapCode Tool",
+    title = "ZC Tool",
     category = CATEGORY,
     string_config(name = CONFIG_NAME),
     text_config(name = CONFIG_DESCRIPTION),
@@ -71,21 +71,21 @@ static CALL_TOOL_FN: &str = "callTool";
     integer_config(name = CONFIG_TIME_LIMIT_MS, default = DEFAULT_TIME_LIMIT_MS, detail),
     integer_config(name = CONFIG_MEMORY_LIMIT_MB, default = DEFAULT_MEMORY_LIMIT_MB, detail),
 )]
-struct ZapCodeToolAgent {
+struct ZcToolAgent {
     data: AgentData,
     name: String,
 }
 
-impl ZapCodeToolAgent {
+impl ZcToolAgent {
     /// Builds the tool from the current configs under the cached name.
-    fn build_tool(&self) -> Result<ZapCodeScriptTool, AgentError> {
+    fn build_tool(&self) -> Result<ZcScriptTool, AgentError> {
         let configs = self.configs()?;
         let description = configs.get_string_or_default(CONFIG_DESCRIPTION);
         let parameters = configs
             .get(CONFIG_PARAMETERS)
             .ok()
             .and_then(|v| serde_json::to_value(v).ok());
-        Ok(ZapCodeScriptTool {
+        Ok(ZcScriptTool {
             info: ToolInfo::new(self.name.clone(), description, parameters),
             script: configs.get_string_or_default(CONFIG_SCRIPT),
             limits: limits_from_configs(configs),
@@ -94,7 +94,7 @@ impl ZapCodeToolAgent {
 }
 
 #[async_trait]
-impl AsAgent for ZapCodeToolAgent {
+impl AsAgent for ZcToolAgent {
     fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
         let name = spec
             .configs
@@ -160,7 +160,7 @@ impl AsAgent for ZapCodeToolAgent {
 /// is name-keyed and process-global, so on rename the old name must still be
 /// removed explicitly or it would leak a stale entry that stop() (which
 /// unregisters the new name) never cleans up.
-fn refresh_registration(old_name: &str, tool: ZapCodeScriptTool) {
+fn refresh_registration(old_name: &str, tool: ZcScriptTool) {
     let new_name = tool.info.name.clone();
     register_tool(tool);
     if old_name != new_name {
@@ -180,7 +180,7 @@ fn is_valid_tool_name(name: &str) -> bool {
 fn warn_if_invalid_name(id: &str, name: &str) {
     if !is_valid_tool_name(name) {
         log::warn!(
-            "ZapCodeToolAgent {} has invalid tool name {:?}; \
+            "ZcToolAgent {} has invalid tool name {:?}; \
              tool names must match ^[a-zA-Z0-9_-]{{1,64}}$",
             id,
             name
@@ -209,14 +209,14 @@ fn limits_from_configs(configs: &AgentConfigs) -> ResourceLimits {
 
 /// The registered tool: runs the script inline on each call, with the call's
 /// arguments bound as variables and `callTool` bridged to the tool registry.
-struct ZapCodeScriptTool {
+struct ZcScriptTool {
     info: ToolInfo,
     script: String,
     limits: ResourceLimits,
 }
 
 #[async_trait]
-impl Tool for ZapCodeScriptTool {
+impl Tool for ZcScriptTool {
     fn info(&self) -> &ToolInfo {
         &self.info
     }
@@ -309,8 +309,8 @@ mod tests {
     use super::*;
     use modular_agent_core::tool::get_tool;
 
-    fn make_tool(name: &str, script: &str) -> ZapCodeScriptTool {
-        ZapCodeScriptTool {
+    fn make_tool(name: &str, script: &str) -> ZcScriptTool {
+        ZcScriptTool {
             info: ToolInfo::new(name, "test tool for the zapcode tool suite", None),
             script: script.to_string(),
             limits: ResourceLimits::default(),

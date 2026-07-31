@@ -4,13 +4,14 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-ZapCode agents for Modular Agent: four agents (`ZapCode Script`, `ZapCode Code Runner`,
-`ZapCode Tool`, `ZapCode Custom Agent`, category `Script/ZapCode`) that run sandboxed
-TypeScript-subset scripts via [zapcode](https://github.com/TheUncharted/zapcode).
+ZapCode agents for Modular Agent: four agents (`ZC Expr`, `ZC Runner`, `ZC Tool`,
+`ZC Script`, category `Script/ZapCode`) that run sandboxed TypeScript-subset scripts
+via [zapcode](https://github.com/TheUncharted/zapcode).
 Out-of-tree package, same shape as `modular-agent-monty`.
 
-Module layout: `value.rs` (AgentValue ↔ zapcode Value bridge), `runner.rs`
-(suspend/resume loop, `ExternalHandler`), `script.rs`, `code.rs`, `tool.rs`, `custom.rs`.
+Module layout: `value.rs` (AgentValue ↔ zapcode Value bridge), `bridge.rs`
+(suspend/resume loop, `ExternalHandler`), `expr.rs` (ZC Expr), `runner.rs` (ZC Runner),
+`tool.rs` (ZC Tool), `script.rs` (ZC Script).
 
 ## Dependency Decisions
 
@@ -25,7 +26,7 @@ Module layout: `value.rs` (AgentValue ↔ zapcode Value bridge), `runner.rs`
 - `indexmap` is a direct dependency only because zapcode-core does not re-export it;
   any 2.x unifies with its pin.
 
-## Channel-Bridge Design (runner.rs)
+## Channel-Bridge Design (bridge.rs)
 
 zapcode has no `register_fn`: when a script calls an external function, the VM
 suspends and hands back a snapshot; the host resumes it with the call's result. The
@@ -50,8 +51,8 @@ bridge in `run_zapcode`:
 `im::HashMap` iteration order is nondeterministic across runs, so
 `agent_value_to_zapcode` sorts object keys before building the script-side object.
 Scripts therefore observe a stable property order (`Object.keys`, `JSON.stringify`,
-iteration) regardless of how the AgentValue was built. The same reasoning makes the
-Custom Agent sort script-declared configs by name: the declaration object arrives as an
+iteration) regardless of how the AgentValue was built. The same reasoning makes
+ZC Script sort script-declared configs by name: the declaration object arrives as an
 `im::HashMap`, its written order is already lost, and sorting is the only deterministic
 choice. Output direction loses order again (`Object` → `im::HashMap`).
 
@@ -60,7 +61,7 @@ choice. Output direction loses order again (`Object` → `im::HashMap`).
 All execution paths lift `max_allocations` to `usize::MAX`: it counts VM stack pushes
 (an instruction-rate proxy, not memory), and the 100k default halts ordinary loops
 within milliseconds. Time and memory are the effective budgets. The one exception is
-the Custom Agent's describe run, which keeps strict defaults on purpose — evaluating
+ZC Script's describe run, which keeps strict defaults on purpose — evaluating
 `AGENT` should be trivial, and the tight budget doubles as enforcement that top-level
 code stays side-effect free.
 
@@ -71,16 +72,16 @@ tool recursion is not stopped by the time limit (documented, guard deferred to v
 ## v2 Notes (deliberately not done)
 
 - **File-based scripted agents**: `*.agent.ts` files appearing in the palette as node
-  types (the monty design doc's original form). The `AGENT` declaration format of the
-  Custom Agent is identical on purpose, so this is additive.
+  types (the monty design doc's original form). The `AGENT` declaration format of
+  ZC Script is identical on purpose, so this is additive.
 - **Snapshot persistence**: postcard dump/load of a suspended VM to resume across
   process restarts.
 - **Bytecode/AST cache**: scripts are currently compiled fresh on every invocation.
-- **Streaming emit**: Custom Agent `emit()` is collected and delivered after the run;
+- **Streaming emit**: ZC Script `emit()` is collected and delivered after the run;
   live delivery would need output during suspension.
 - **Guest exception injection**: turn handler errors into catchable script exceptions
   instead of aborting the run.
-- **Code Runner `value` data input port**: feed data alongside the generated code.
+- **ZC Runner `value` data input port**: feed data alongside the generated code.
 - **Tool recursion guard**: call-depth tracking for `callTool` chains.
 
 ## Build and Test

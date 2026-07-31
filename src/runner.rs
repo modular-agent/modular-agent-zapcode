@@ -1,145 +1,331 @@
-use modular_agent_core::{AgentError, AgentValue, async_trait};
-use tokio::sync::{mpsc, oneshot};
-use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeRun};
+use std::collections::BTreeSet;
 
-use crate::value::{agent_value_to_zapcode, zapcode_to_agent_value};
+use modular_agent_core::{
+    Agent, AgentContext, AgentData, AgentError, AgentOutput, AgentSpec, AgentValue, AgentValueMap,
+    AsAgent, ModularAgent, async_trait, modular_agent,
+    tool::{call_tool, list_tool_infos_patterns},
+};
+use zapcode_core::ResourceLimits;
 
-/// Handles external function calls made by a running script.
+use crate::bridge::{ExternalHandler, run_zapcode};
+
+static CATEGORY: &str = "Script/ZapCode";
+
+static PORT_SCRIPT: &str = "script";
+static PORT_VALUE: &str = "value";
+static PORT_CONSOLE: &str = "console";
+
+static CONFIG_TOOLS: &str = "tools";
+static CONFIG_STRIP_FENCES: &str = "strip_fences";
+static CONFIG_TIME_LIMIT_MS: &str = "time_limit_ms";
+static CONFIG_MEMORY_LIMIT_MB: &str = "memory_limit_mb";
+
+static EXTERNAL_CALL_TOOL: &str = "callTool";
+
+const DEFAULT_TIME_LIMIT_MS: i64 = 5000;
+const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
+
+/// Executes LLM-generated TypeScript code with access to registered tools.
 ///
-/// A suspended VM hands the call name and arguments to the handler; the value
-/// it returns resumes the script as the call's result. Returning an error
-/// aborts the run.
-#[async_trait]
-pub(crate) trait ExternalHandler: Send {
-    async fn call(&mut self, name: String, args: Vec<AgentValue>)
-    -> Result<AgentValue, AgentError>;
+/// Send generated code — a string, or a message whose text is the code — to the
+/// `script` port. The code runs in a sandboxed TypeScript-subset interpreter
+/// with no filesystem, network, or environment access, and the value of its
+/// last expression becomes the `value` output. Compile and runtime errors fail
+/// the run and flow out of the error port; wiring that port back into a chat
+/// agent gives the LLM a chance to correct its own code.
+///
+/// Tools selected by the `tools` patterns are callable from the script. Each
+/// selected tool whose name is a valid identifier is available as a global
+/// async function taking a single arguments object, for example
+/// `await webSearch({ query: "rust" })`. Every selected tool — including names
+/// that are not valid identifiers, such as `web-search` — can also be invoked
+/// as `await callTool("web-search", { query: "rust" })`. Tools not selected by
+/// the patterns cannot be called either way.
+///
+/// # Ports
+/// - Input `script`: Code to execute, as a string or a message (its text is
+///   used). With `strip_fences` enabled, a reply consisting of a single
+///   Markdown code fence (e.g. a ts-tagged fence) is unwrapped automatically
+/// - Output `value`: Value of the last expression in the script
+/// - Output `console`: Console output captured from the script, emitted before
+///   `value` and omitted when empty. Capture stops at the first tool call:
+///   anything logged after it is lost
+///
+/// # Configuration
+/// - `tools`: Newline-separated regular expressions selecting which registered
+///   tools the script may call (same semantics as the LLM chat agents'
+///   `tools` config). Empty means the script can call no tools
+/// - `strip_fences`: Unwrap a reply that is a single Markdown code fence
+///   before executing it (default: true)
+/// - `time_limit_ms`: Time limit in milliseconds for each stretch of script
+///   execution between tool calls; the clock restarts after every tool call,
+///   so it does not bound the total run (default: 5000)
+/// - `memory_limit_mb`: Script memory limit in megabytes (default: 32)
+///
+/// # Example
+/// Given a chat reply containing only a ts-tagged code fence around
+/// `const r = await webSearch({ query: "rust" }); r.results.length`, with a
+/// `tools` pattern matching `webSearch`, the fence is stripped, the search
+/// tool is called, and the result count is emitted on `value`.
+#[modular_agent(
+    title = "ZC Runner",
+    category = CATEGORY,
+    inputs = [PORT_SCRIPT],
+    outputs = [PORT_VALUE, PORT_CONSOLE],
+    text_config(
+        name = CONFIG_TOOLS,
+        title = "Tools",
+        description = "Newline-separated regex patterns selecting callable tools"
+    ),
+    boolean_config(
+        name = CONFIG_STRIP_FENCES,
+        title = "Strip Code Fences",
+        default = true,
+        description = "Unwrap a single Markdown code fence around the input",
+        detail
+    ),
+    integer_config(
+        name = CONFIG_TIME_LIMIT_MS,
+        title = "Time Limit (ms)",
+        default = 5000,
+        detail
+    ),
+    integer_config(
+        name = CONFIG_MEMORY_LIMIT_MB,
+        title = "Memory Limit (MB)",
+        default = 32,
+        detail
+    ),
+)]
+struct ZcRunnerAgent {
+    data: AgentData,
 }
 
-/// Handler for scripts that declare no external functions; any call is a bug
-/// in the caller's `externals` list, so it just errors.
-// Only tests run scripts without externals today; production callers all have
-// real handlers.
-#[cfg(test)]
-pub(crate) struct NoExternals;
-
-#[cfg(test)]
 #[async_trait]
-impl ExternalHandler for NoExternals {
+impl AsAgent for ZcRunnerAgent {
+    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+        Ok(Self {
+            data: AgentData::new(ma, id, spec),
+        })
+    }
+
+    async fn process(
+        &mut self,
+        ctx: AgentContext,
+        _port: String,
+        value: AgentValue,
+    ) -> Result<(), AgentError> {
+        let config = self.configs()?;
+
+        let text = match &value {
+            AgentValue::String(s) => s.as_ref().clone(),
+            AgentValue::Message(m) => m.text(),
+            _ => {
+                return Err(AgentError::InvalidValue(
+                    "script input must be a string or a message".into(),
+                ));
+            }
+        };
+        let source = if config.get_bool_or(CONFIG_STRIP_FENCES, true) {
+            strip_code_fence(&text).to_string()
+        } else {
+            text
+        };
+        if source.trim().is_empty() {
+            return Ok(());
+        }
+
+        let (externals, allowed) = tool_externals(&config.get_string_or_default(CONFIG_TOOLS))?;
+        let limits = ResourceLimits {
+            time_limit_ms: config
+                .get_integer_or(CONFIG_TIME_LIMIT_MS, DEFAULT_TIME_LIMIT_MS)
+                .max(1) as u64,
+            memory_limit_bytes: config
+                .get_integer_or(CONFIG_MEMORY_LIMIT_MB, DEFAULT_MEMORY_LIMIT_MB)
+                .max(1) as usize
+                * 1024
+                * 1024,
+            // max_allocations counts VM stack pushes — an instruction-rate
+            // proxy, not memory — and the 100k default halts ordinary loops
+            // within milliseconds. The wall-clock time limit is the budget.
+            max_allocations: usize::MAX,
+            ..ResourceLimits::default()
+        };
+
+        let mut handler = ToolDispatcher {
+            ctx: ctx.clone(),
+            allowed,
+        };
+        let outcome = run_zapcode(source, vec![], externals, limits, &mut handler).await?;
+
+        if !outcome.console.is_empty() {
+            self.output(
+                ctx.clone(),
+                PORT_CONSOLE,
+                AgentValue::string(outcome.console),
+            )
+            .await?;
+        }
+        self.output(ctx, PORT_VALUE, outcome.value).await
+    }
+}
+
+/// Routes external calls from the script to the tool registry. Direct calls
+/// (`webSearch({…})`) and `callTool("name", {…})` converge on the same
+/// allowlist, so tools outside the `tools` patterns stay unreachable.
+struct ToolDispatcher {
+    ctx: AgentContext,
+    allowed: BTreeSet<String>,
+}
+
+#[async_trait]
+impl ExternalHandler for ToolDispatcher {
     async fn call(
         &mut self,
         name: String,
-        _args: Vec<AgentValue>,
+        args: Vec<AgentValue>,
     ) -> Result<AgentValue, AgentError> {
-        Err(AgentError::InvalidValue(format!(
-            "ZapCode runtime error: external function `{name}` is not available here"
-        )))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ZapOutcome {
-    pub(crate) value: AgentValue,
-    /// Console output captured up to completion or the first external call.
-    /// Output emitted after a resume is lost (upstream limitation: the
-    /// snapshot carries it internally but exposes no accessor).
-    pub(crate) console: String,
-}
-
-struct HostRequest {
-    name: String,
-    args: Vec<AgentValue>,
-    respond: oneshot::Sender<Result<AgentValue, AgentError>>,
-}
-
-/// Runs a ZapCode script, bridging external function calls to `handler`.
-///
-/// The VM lives entirely inside one `spawn_blocking` closure; only
-/// `AgentValue`s cross the channel between the VM thread and the async side,
-/// so the snapshot and zapcode values never move across threads. Each
-/// suspension sends a `HostRequest` and blocks until the async side replies
-/// with the handler's result.
-pub(crate) async fn run_zapcode(
-    source: String,
-    inputs: Vec<(String, AgentValue)>,
-    externals: Vec<String>,
-    limits: ResourceLimits,
-    handler: &mut dyn ExternalHandler,
-) -> Result<ZapOutcome, AgentError> {
-    let (req_tx, mut req_rx) = mpsc::channel::<HostRequest>(1);
-
-    let join = tokio::task::spawn_blocking(move || -> Result<ZapOutcome, AgentError> {
-        let input_names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-        let input_values: Vec<(String, Value)> = inputs
-            .iter()
-            .map(|(name, v)| (name.clone(), agent_value_to_zapcode(v)))
-            .collect();
-
-        let runner =
-            ZapcodeRun::new(source, input_names, externals, limits).map_err(map_zapcode_error)?;
-        let result = runner.run(input_values).map_err(map_zapcode_error)?;
-        let console = result.stdout;
-        let mut state = result.state;
-
-        loop {
-            match state {
-                VmState::Complete(v) => {
-                    return Ok(ZapOutcome {
-                        value: zapcode_to_agent_value(v)?,
-                        console,
-                    });
-                }
-                VmState::Suspended {
-                    function_name,
-                    args,
-                    snapshot,
-                } => {
-                    let args = args
-                        .into_iter()
-                        .map(zapcode_to_agent_value)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let (respond, reply_rx) = oneshot::channel();
-                    req_tx
-                        .blocking_send(HostRequest {
-                            name: function_name,
-                            args,
-                            respond,
-                        })
-                        .map_err(|_| bridge_closed())?;
-                    let ret = reply_rx.blocking_recv().map_err(|_| bridge_closed())??;
-                    state = snapshot
-                        .resume(agent_value_to_zapcode(&ret))
-                        .map_err(map_zapcode_error)?;
-                }
+        let (tool_name, tool_args) = if name == EXTERNAL_CALL_TOOL {
+            if args.len() > 2 {
+                return Err(AgentError::InvalidValue(
+                    "callTool takes a tool name and one arguments object".into(),
+                ));
             }
-        }
-    });
+            let mut args = args.into_iter();
+            let tool_name = match args.next() {
+                Some(AgentValue::String(s)) => s.as_ref().clone(),
+                _ => {
+                    return Err(AgentError::InvalidValue(
+                        "callTool expects a tool name string as its first argument".into(),
+                    ));
+                }
+            };
+            (tool_name, args.next())
+        } else {
+            if args.len() > 1 {
+                return Err(AgentError::InvalidValue(format!(
+                    "`{name}` takes a single arguments object"
+                )));
+            }
+            (name, args.into_iter().next())
+        };
 
-    // The closure's req_tx drops when it returns, ending this loop.
-    while let Some(req) = req_rx.recv().await {
-        let result = handler.call(req.name, req.args).await;
-        // A closed reply channel means the VM task is already gone; its join
-        // result below carries the real error.
-        let _ = req.respond.send(result);
+        if !self.allowed.contains(&tool_name) {
+            return Err(AgentError::InvalidValue(format!(
+                "tool `{tool_name}` does not match the tools config"
+            )));
+        }
+        let tool_args = tool_args.unwrap_or_else(|| AgentValue::Object(AgentValueMap::new()));
+        call_tool(self.ctx.clone(), &tool_name, tool_args).await
     }
-
-    join.await
-        .map_err(|e| AgentError::IoError(format!("ZapCode task error: {e}")))?
 }
 
-// The async side dropping its channel ends mid-run only if run_zapcode's
-// future is cancelled; surface it as an I/O-level failure, not a script error.
-fn bridge_closed() -> AgentError {
-    AgentError::IoError("ZapCode host bridge closed".into())
-}
-
-pub(crate) fn map_zapcode_error(e: ZapcodeError) -> AgentError {
-    match e {
-        ZapcodeError::ParseError(_)
-        | ZapcodeError::UnsupportedSyntax { .. }
-        | ZapcodeError::CompileError(_) => {
-            AgentError::InvalidValue(format!("ZapCode compile error: {e}"))
+/// Resolves the `tools` patterns into the externals to declare to the VM and
+/// the set of tool names the dispatcher may call. `callTool` is always
+/// declared; matched tools are additionally exposed under their own name when
+/// it is a valid identifier.
+fn tool_externals(patterns: &str) -> Result<(Vec<String>, BTreeSet<String>), AgentError> {
+    let mut externals = vec![EXTERNAL_CALL_TOOL.to_string()];
+    let mut allowed = BTreeSet::new();
+    if patterns.is_empty() {
+        return Ok((externals, allowed));
+    }
+    let infos = list_tool_infos_patterns(patterns).map_err(|e| {
+        AgentError::InvalidConfig(format!("Invalid regex patterns in tools config: {e}"))
+    })?;
+    for info in infos {
+        if !allowed.insert(info.name.clone()) {
+            continue;
         }
-        other => AgentError::InvalidValue(format!("ZapCode runtime error: {other}")),
+        if info.name != EXTERNAL_CALL_TOOL && is_ts_identifier(&info.name) {
+            externals.push(info.name);
+        } else {
+            log::debug!(
+                "tool `{}` is not a valid script identifier; reachable via callTool only",
+                info.name
+            );
+        }
+    }
+    Ok((externals, allowed))
+}
+
+// Reserved words that the registry's tool-name rule (`^[a-zA-Z0-9_-]{1,64}$`)
+// would otherwise let through; exposing one as a global would not parse.
+static RESERVED_WORDS: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+fn is_ts_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !RESERVED_WORDS.contains(&name)
+}
+
+/// Unwraps input that is exactly one fenced code block; anything else —
+/// prose around a fence, multiple fences, no fence — is returned unchanged.
+fn strip_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return text;
+    };
+    let Some(rest) = rest.strip_suffix("```") else {
+        return text;
+    };
+    // The first line is the info string ("ts"). A remaining ``` means the
+    // input held more than one fence, so it is not a single block.
+    match rest.split_once('\n') {
+        Some((_, body)) if !body.contains("```") => body,
+        _ => text,
     }
 }
 
@@ -147,155 +333,45 @@ pub(crate) fn map_zapcode_error(e: ZapcodeError) -> AgentError {
 mod tests {
     use super::*;
 
-    fn default_limits() -> ResourceLimits {
-        ResourceLimits::default()
-    }
-
-    async fn run_simple(source: &str) -> Result<ZapOutcome, AgentError> {
-        run_zapcode(
-            source.to_string(),
-            vec![],
-            vec![],
-            default_limits(),
-            &mut NoExternals,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn addition_returns_last_expression() {
-        let outcome = run_simple("1 + 2").await.unwrap();
-        assert!(matches!(outcome.value, AgentValue::Integer(3)));
-    }
-
-    struct FakeHandler {
-        calls: Vec<(String, Vec<AgentValue>)>,
-        replies: Vec<AgentValue>,
-    }
-
-    #[async_trait]
-    impl ExternalHandler for FakeHandler {
-        async fn call(
-            &mut self,
-            name: String,
-            args: Vec<AgentValue>,
-        ) -> Result<AgentValue, AgentError> {
-            self.calls.push((name, args));
-            Ok(self.replies.remove(0))
-        }
-    }
-
-    #[tokio::test]
-    async fn suspend_resume_calls_handler_in_order() {
-        let mut handler = FakeHandler {
-            calls: vec![],
-            replies: vec![AgentValue::Integer(10), AgentValue::Integer(100)],
-        };
-        let outcome = run_zapcode(
-            "const a = await getNum(1);\nconst b = await getNum(a + 1);\na + b".to_string(),
-            vec![],
-            vec!["getNum".to_string()],
-            default_limits(),
-            &mut handler,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(outcome.value, AgentValue::Integer(110)));
-        assert_eq!(handler.calls.len(), 2);
-        assert_eq!(handler.calls[0].0, "getNum");
-        assert!(matches!(handler.calls[0].1[..], [AgentValue::Integer(1)]));
-        assert_eq!(handler.calls[1].0, "getNum");
-        assert!(matches!(handler.calls[1].1[..], [AgentValue::Integer(11)]));
-    }
-
-    struct FailingHandler;
-
-    #[async_trait]
-    impl ExternalHandler for FailingHandler {
-        async fn call(
-            &mut self,
-            _name: String,
-            _args: Vec<AgentValue>,
-        ) -> Result<AgentValue, AgentError> {
-            Err(AgentError::InvalidValue("tool exploded".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn handler_error_aborts_the_run() {
-        let err = run_zapcode(
-            "await boom(); 42".to_string(),
-            vec![],
-            vec!["boom".to_string()],
-            default_limits(),
-            &mut FailingHandler,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("tool exploded"));
-    }
-
-    #[tokio::test]
-    async fn undeclared_external_function_errors() {
-        let err = run_simple("missingFunc()").await.unwrap_err();
-        assert!(err.to_string().contains("ZapCode runtime error"));
-    }
-
-    #[tokio::test]
-    async fn infinite_loop_hits_time_limit() {
-        // Every VM push counts as an allocation, so an empty loop would trip
-        // max_allocations long before 50ms; lift it so the clock fires first.
-        let limits = ResourceLimits {
-            time_limit_ms: 50,
-            max_allocations: usize::MAX,
-            ..ResourceLimits::default()
-        };
-        let err = run_zapcode(
-            "while (true) {}".to_string(),
-            vec![],
-            vec![],
-            limits,
-            &mut NoExternals,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("time limit exceeded"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn stdout_is_captured() {
-        let outcome = run_simple("console.log(\"hello\");\n1").await.unwrap();
-        assert_eq!(outcome.console, "hello\n");
-        assert!(matches!(outcome.value, AgentValue::Integer(1)));
-    }
-
-    #[tokio::test]
-    async fn inputs_are_bound_as_globals() {
-        let outcome = run_zapcode(
-            "value * 2".to_string(),
-            vec![("value".to_string(), AgentValue::Integer(21))],
-            vec![],
-            default_limits(),
-            &mut NoExternals,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome.value, AgentValue::Integer(42)));
-    }
-
-    #[tokio::test]
-    async fn compile_error_is_labeled() {
-        let err = run_simple("const = ;").await.unwrap_err();
-        assert!(err.to_string().contains("ZapCode compile error"));
-    }
-
-    // Records current reality: the bridge design does not depend on this, but
-    // if it ever stops compiling, the channel confinement becomes load-bearing.
     #[test]
-    fn snapshot_and_value_are_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<zapcode_core::ZapcodeSnapshot>();
-        assert_send::<zapcode_core::Value>();
+    fn strip_code_fence_unwraps_single_fence() {
+        assert_eq!(strip_code_fence("```ts\n1 + 2\n```"), "1 + 2\n");
+        assert_eq!(
+            strip_code_fence("  ```typescript\nlet a = 1;\na\n```  "),
+            "let a = 1;\na\n"
+        );
+        assert_eq!(strip_code_fence("```\n1\n```"), "1\n");
+    }
+
+    #[test]
+    fn strip_code_fence_leaves_other_text_unchanged() {
+        assert_eq!(strip_code_fence("1 + 2"), "1 + 2");
+        let prose = "Here is the code:\n```ts\n1\n```";
+        assert_eq!(strip_code_fence(prose), prose);
+        let two_fences = "```ts\n1\n```\nand\n```ts\n2\n```";
+        assert_eq!(strip_code_fence(two_fences), two_fences);
+        assert_eq!(strip_code_fence("``````"), "``````");
+    }
+
+    #[test]
+    fn ts_identifier_accepts_plain_names_only() {
+        assert!(is_ts_identifier("webSearch"));
+        assert!(is_ts_identifier("_tool2"));
+        assert!(!is_ts_identifier("web-search"));
+        assert!(!is_ts_identifier("2fast"));
+        assert!(!is_ts_identifier(""));
+        assert!(!is_ts_identifier("delete"));
+    }
+
+    #[test]
+    fn tool_externals_always_declares_call_tool() {
+        let (externals, allowed) = tool_externals("").unwrap();
+        assert_eq!(externals, vec![EXTERNAL_CALL_TOOL.to_string()]);
+        assert!(allowed.is_empty());
+    }
+
+    #[test]
+    fn tool_externals_rejects_bad_regex() {
+        assert!(tool_externals("[unclosed").is_err());
     }
 }
