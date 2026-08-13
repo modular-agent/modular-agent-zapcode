@@ -1,0 +1,3 @@
+name: modular-agent-zapcode
+description: ZapCode TypeScript script agents
+default_for: [desktop, cli]
