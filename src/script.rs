@@ -81,7 +81,7 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 ///   nothing.
 /// - `getConfig(name)`: Read a config value (`null` when unset).
 /// - `getState(key)` / `setState(key, value)`: Per-node state that persists
-///   across runs. It lives in memory only and is not saved with the preset.
+///   across runs. It lives in memory only and is not saved with the patch.
 /// - `log(message)`: Write a message to the application log.
 /// - `callTool(name, args)`: Call a registered LLM tool and return its result.
 ///
@@ -509,7 +509,7 @@ fn apply_declaration(spec: &mut AgentSpec, decl: &Declaration) -> Result<(), Age
     for (name, config_spec) in &decl.configs {
         // `AgentDefinition::reconcile_spec` moves configs the definition does
         // not declare - which includes every script-declared one - to a
-        // `_`-prefixed key when a preset is loaded. Fall back to it so saved
+        // `_`-prefixed key when a patch is loaded. Fall back to it so saved
         // values survive a reload.
         let stale_name = format!("_{name}");
         let value = if old.contains_key(name) {

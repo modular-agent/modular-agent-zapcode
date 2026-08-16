@@ -180,7 +180,7 @@ function onInput(port, value) {
 }
 ```
 
-When the script changes, `AGENT` is re-evaluated (with no host functions and a short time budget, so top-level code must be free of side effects) and the node's ports and config fields update immediately. A broken script does not kill the node: it keeps its last valid ports and configs, and the error is reported. `name`, `title`, `category`, and `description` keys in `AGENT` are accepted and ignored. Declared config fields appear in the inspector sorted by name; their saved values survive preset save/reload.
+When the script changes, `AGENT` is re-evaluated (with no host functions and a short time budget, so top-level code must be free of side effects) and the node's ports and config fields update immediately. A broken script does not kill the node: it keeps its last valid ports and configs, and the error is reported. `name`, `title`, `category`, and `description` keys in `AGENT` are accepted and ignored. Declared config fields appear in the inspector sorted by name; their saved values survive patch save/reload.
 
 Inside `onInput` (plain or `async`), these host functions are available:
 
@@ -188,7 +188,7 @@ Inside `onInput` (plain or `async`), these host functions are available:
 | -------- | -------- |
 | `emit(port, value)` | Send a value to a declared output port. Emits are collected and delivered after the script finishes; a failed run delivers nothing |
 | `getConfig(name)` | Read a config value (`null` when unset) |
-| `getState(key)` / `setState(key, value)` | Per-node state that persists across runs. In memory only — not saved with the preset |
+| `getState(key)` / `setState(key, value)` | Per-node state that persists across runs. In memory only — not saved with the patch |
 | `log(message)` | Write a message to the application log |
 | `callTool(name, args)` | Call a registered LLM tool and return its result |
 
