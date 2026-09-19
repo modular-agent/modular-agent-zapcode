@@ -1,8 +1,8 @@
-use modular_agent_core::{AgentError, AgentValue, async_trait};
+use modular_agent_core::{Error, Result, Value, async_trait};
 use tokio::sync::{mpsc, oneshot};
-use zapcode_core::{ResourceLimits, Value, VmState, ZapcodeError, ZapcodeRun};
+use zapcode_core::{ResourceLimits, Value as ZapValue, VmState, ZapcodeError, ZapcodeRun};
 
-use crate::value::{agent_value_to_zapcode, zapcode_to_agent_value};
+use crate::value::{value_to_zapcode, zapcode_to_value};
 
 /// Handles external function calls made by a running script.
 ///
@@ -11,8 +11,7 @@ use crate::value::{agent_value_to_zapcode, zapcode_to_agent_value};
 /// aborts the run.
 #[async_trait]
 pub(crate) trait ExternalHandler: Send {
-    async fn call(&mut self, name: String, args: Vec<AgentValue>)
-    -> Result<AgentValue, AgentError>;
+    async fn call(&mut self, name: String, args: Vec<Value>) -> Result<Value>;
 }
 
 /// Handler for scripts that declare no external functions; any call is a bug
@@ -25,12 +24,8 @@ pub(crate) struct NoExternals;
 #[cfg(test)]
 #[async_trait]
 impl ExternalHandler for NoExternals {
-    async fn call(
-        &mut self,
-        name: String,
-        _args: Vec<AgentValue>,
-    ) -> Result<AgentValue, AgentError> {
-        Err(AgentError::InvalidValue(format!(
+    async fn call(&mut self, name: String, _args: Vec<Value>) -> Result<Value> {
+        Err(Error::InvalidValue(format!(
             "ZapCode runtime error: external function `{name}` is not available here"
         )))
     }
@@ -38,7 +33,7 @@ impl ExternalHandler for NoExternals {
 
 #[derive(Debug)]
 pub(crate) struct ZapOutcome {
-    pub(crate) value: AgentValue,
+    pub(crate) value: Value,
     /// Console output captured up to completion or the first external call.
     /// Output emitted after a resume is lost (upstream limitation: the
     /// snapshot carries it internally but exposes no accessor).
@@ -47,31 +42,31 @@ pub(crate) struct ZapOutcome {
 
 struct HostRequest {
     name: String,
-    args: Vec<AgentValue>,
-    respond: oneshot::Sender<Result<AgentValue, AgentError>>,
+    args: Vec<Value>,
+    respond: oneshot::Sender<Result<Value>>,
 }
 
 /// Runs a ZapCode script, bridging external function calls to `handler`.
 ///
 /// The VM lives entirely inside one `spawn_blocking` closure; only
-/// `AgentValue`s cross the channel between the VM thread and the async side,
+/// `Value`s cross the channel between the VM thread and the async side,
 /// so the snapshot and zapcode values never move across threads. Each
 /// suspension sends a `HostRequest` and blocks until the async side replies
 /// with the handler's result.
 pub(crate) async fn run_zapcode(
     source: String,
-    inputs: Vec<(String, AgentValue)>,
+    inputs: Vec<(String, Value)>,
     externals: Vec<String>,
     limits: ResourceLimits,
     handler: &mut dyn ExternalHandler,
-) -> Result<ZapOutcome, AgentError> {
+) -> Result<ZapOutcome> {
     let (req_tx, mut req_rx) = mpsc::channel::<HostRequest>(1);
 
-    let join = tokio::task::spawn_blocking(move || -> Result<ZapOutcome, AgentError> {
+    let join = tokio::task::spawn_blocking(move || -> Result<ZapOutcome> {
         let input_names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-        let input_values: Vec<(String, Value)> = inputs
+        let input_values: Vec<(String, ZapValue)> = inputs
             .iter()
-            .map(|(name, v)| (name.clone(), agent_value_to_zapcode(v)))
+            .map(|(name, v)| (name.clone(), value_to_zapcode(v)))
             .collect();
 
         let runner =
@@ -84,7 +79,7 @@ pub(crate) async fn run_zapcode(
             match state {
                 VmState::Complete(v) => {
                     return Ok(ZapOutcome {
-                        value: zapcode_to_agent_value(v)?,
+                        value: zapcode_to_value(v)?,
                         console,
                     });
                 }
@@ -95,7 +90,7 @@ pub(crate) async fn run_zapcode(
                 } => {
                     let args = args
                         .into_iter()
-                        .map(zapcode_to_agent_value)
+                        .map(zapcode_to_value)
                         .collect::<Result<Vec<_>, _>>()?;
                     let (respond, reply_rx) = oneshot::channel();
                     req_tx
@@ -107,7 +102,7 @@ pub(crate) async fn run_zapcode(
                         .map_err(|_| bridge_closed())?;
                     let ret = reply_rx.blocking_recv().map_err(|_| bridge_closed())??;
                     state = snapshot
-                        .resume(agent_value_to_zapcode(&ret))
+                        .resume(value_to_zapcode(&ret))
                         .map_err(map_zapcode_error)?;
                 }
             }
@@ -123,23 +118,23 @@ pub(crate) async fn run_zapcode(
     }
 
     join.await
-        .map_err(|e| AgentError::IoError(format!("ZapCode task error: {e}")))?
+        .map_err(|e| Error::IoError(format!("ZapCode task error: {e}")))?
 }
 
 // The async side dropping its channel ends mid-run only if run_zapcode's
 // future is cancelled; surface it as an I/O-level failure, not a script error.
-fn bridge_closed() -> AgentError {
-    AgentError::IoError("ZapCode host bridge closed".into())
+fn bridge_closed() -> Error {
+    Error::IoError("ZapCode host bridge closed".into())
 }
 
-pub(crate) fn map_zapcode_error(e: ZapcodeError) -> AgentError {
+pub(crate) fn map_zapcode_error(e: ZapcodeError) -> Error {
     match e {
         ZapcodeError::ParseError(_)
         | ZapcodeError::UnsupportedSyntax { .. }
         | ZapcodeError::CompileError(_) => {
-            AgentError::InvalidValue(format!("ZapCode compile error: {e}"))
+            Error::InvalidValue(format!("ZapCode compile error: {e}"))
         }
-        other => AgentError::InvalidValue(format!("ZapCode runtime error: {other}")),
+        other => Error::InvalidValue(format!("ZapCode runtime error: {other}")),
     }
 }
 
@@ -151,7 +146,7 @@ mod tests {
         ResourceLimits::default()
     }
 
-    async fn run_simple(source: &str) -> Result<ZapOutcome, AgentError> {
+    async fn run_simple(source: &str) -> Result<ZapOutcome> {
         run_zapcode(
             source.to_string(),
             vec![],
@@ -165,21 +160,17 @@ mod tests {
     #[tokio::test]
     async fn addition_returns_last_expression() {
         let outcome = run_simple("1 + 2").await.unwrap();
-        assert!(matches!(outcome.value, AgentValue::Integer(3)));
+        assert!(matches!(outcome.value, Value::Integer(3)));
     }
 
     struct FakeHandler {
-        calls: Vec<(String, Vec<AgentValue>)>,
-        replies: Vec<AgentValue>,
+        calls: Vec<(String, Vec<Value>)>,
+        replies: Vec<Value>,
     }
 
     #[async_trait]
     impl ExternalHandler for FakeHandler {
-        async fn call(
-            &mut self,
-            name: String,
-            args: Vec<AgentValue>,
-        ) -> Result<AgentValue, AgentError> {
+        async fn call(&mut self, name: String, args: Vec<Value>) -> Result<Value> {
             self.calls.push((name, args));
             Ok(self.replies.remove(0))
         }
@@ -189,7 +180,7 @@ mod tests {
     async fn suspend_resume_calls_handler_in_order() {
         let mut handler = FakeHandler {
             calls: vec![],
-            replies: vec![AgentValue::Integer(10), AgentValue::Integer(100)],
+            replies: vec![Value::Integer(10), Value::Integer(100)],
         };
         let outcome = run_zapcode(
             "const a = await getNum(1);\nconst b = await getNum(a + 1);\na + b".to_string(),
@@ -201,24 +192,20 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(outcome.value, AgentValue::Integer(110)));
+        assert!(matches!(outcome.value, Value::Integer(110)));
         assert_eq!(handler.calls.len(), 2);
         assert_eq!(handler.calls[0].0, "getNum");
-        assert!(matches!(handler.calls[0].1[..], [AgentValue::Integer(1)]));
+        assert!(matches!(handler.calls[0].1[..], [Value::Integer(1)]));
         assert_eq!(handler.calls[1].0, "getNum");
-        assert!(matches!(handler.calls[1].1[..], [AgentValue::Integer(11)]));
+        assert!(matches!(handler.calls[1].1[..], [Value::Integer(11)]));
     }
 
     struct FailingHandler;
 
     #[async_trait]
     impl ExternalHandler for FailingHandler {
-        async fn call(
-            &mut self,
-            _name: String,
-            _args: Vec<AgentValue>,
-        ) -> Result<AgentValue, AgentError> {
-            Err(AgentError::InvalidValue("tool exploded".into()))
+        async fn call(&mut self, _name: String, _args: Vec<Value>) -> Result<Value> {
+            Err(Error::InvalidValue("tool exploded".into()))
         }
     }
 
@@ -267,21 +254,21 @@ mod tests {
     async fn stdout_is_captured() {
         let outcome = run_simple("console.log(\"hello\");\n1").await.unwrap();
         assert_eq!(outcome.console, "hello\n");
-        assert!(matches!(outcome.value, AgentValue::Integer(1)));
+        assert!(matches!(outcome.value, Value::Integer(1)));
     }
 
     #[tokio::test]
     async fn inputs_are_bound_as_globals() {
         let outcome = run_zapcode(
             "value * 2".to_string(),
-            vec![("value".to_string(), AgentValue::Integer(21))],
+            vec![("value".to_string(), Value::Integer(21))],
             vec![],
             default_limits(),
             &mut NoExternals,
         )
         .await
         .unwrap();
-        assert!(matches!(outcome.value, AgentValue::Integer(42)));
+        assert!(matches!(outcome.value, Value::Integer(42)));
     }
 
     #[tokio::test]

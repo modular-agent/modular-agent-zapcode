@@ -1,6 +1,6 @@
 use modular_agent_core::{
-    Agent, AgentContext, AgentData, AgentError, AgentOutput, AgentSpec, AgentValue, AsAgent,
-    ModularAgent, async_trait, modular_agent, tool::call_tool,
+    AsModule, Error, ModularAgent, Module, ModuleContext, ModuleData, ModuleOutput, ModuleSpec,
+    Result, Value, async_trait, modular_agent, tool::call_tool,
 };
 use zapcode_core::ResourceLimits;
 
@@ -28,10 +28,10 @@ static EXTERNAL_CALL_TOOL: &str = "callTool";
 ///   both become a unit value)
 /// - Scripts are compiled fresh on each invocation; an empty script does nothing
 /// - `await callTool(name, args)` calls a tool registered in this application
-///   (e.g. by a ZC Tool agent) and returns its result; a failed tool call aborts
+///   (e.g. by a ZC Tool module) and returns its result; a failed tool call aborts
 ///   the script with an error
 /// - `console.log` output is written to the application log, tagged with the
-///   agent id (output after the first `callTool` is not captured)
+///   module id (output after the first `callTool` is not captured)
 /// - Scripts are sandboxed: no filesystem, network, or environment access, and
 ///   no `import` / `require` / `eval`; execution stops with an error when a
 ///   resource limit is exceeded
@@ -61,24 +61,19 @@ static EXTERNAL_CALL_TOOL: &str = "callTool";
     integer_config(name = CONFIG_TIME_LIMIT_MS, default = 5000, detail),
     integer_config(name = CONFIG_MEMORY_LIMIT_MB, default = 32, detail),
 )]
-struct ZcExprAgent {
-    data: AgentData,
+struct ZcExprModule {
+    data: ModuleData,
 }
 
 #[async_trait]
-impl AsAgent for ZcExprAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for ZcExprModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
         })
     }
 
-    async fn process(
-        &mut self,
-        ctx: AgentContext,
-        _port: String,
-        value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, ctx: ModuleContext, _port: String, value: Value) -> Result<()> {
         let config = self.configs()?;
         let script = config.get_string(CONFIG_EXPR)?;
         if script.is_empty() {
@@ -111,7 +106,7 @@ impl AsAgent for ZcExprAgent {
             log::info!("[{}] {}", self.id(), outcome.console.trim_end_matches('\n'));
         }
 
-        if skip_unit && matches!(outcome.value, AgentValue::Unit) {
+        if skip_unit && matches!(outcome.value, Value::Unit) {
             return Ok(());
         }
         self.output(ctx, PORT_VALUE, outcome.value).await
@@ -121,27 +116,23 @@ impl AsAgent for ZcExprAgent {
 /// Bridges the script's `callTool(name, args)` external to the core tool
 /// registry. `args` is optional on the guest side and defaults to unit.
 struct ToolCallHandler {
-    ctx: AgentContext,
+    ctx: ModuleContext,
 }
 
 #[async_trait]
 impl ExternalHandler for ToolCallHandler {
-    async fn call(
-        &mut self,
-        name: String,
-        mut args: Vec<AgentValue>,
-    ) -> Result<AgentValue, AgentError> {
+    async fn call(&mut self, name: String, mut args: Vec<Value>) -> Result<Value> {
         if name != EXTERNAL_CALL_TOOL {
             // Unreachable while callTool is the only declared external; kept as
             // a guard so a future externals change cannot silently misroute.
-            return Err(AgentError::InvalidValue(format!(
+            return Err(Error::InvalidValue(format!(
                 "ZapCode runtime error: external function `{name}` is not available here"
             )));
         }
         let tool_name = match args.first() {
-            Some(AgentValue::String(s)) => s.to_string(),
+            Some(Value::String(s)) => s.to_string(),
             _ => {
-                return Err(AgentError::InvalidValue(
+                return Err(Error::InvalidValue(
                     "callTool: first argument must be a tool name string".into(),
                 ));
             }
@@ -149,7 +140,7 @@ impl ExternalHandler for ToolCallHandler {
         let tool_args = if args.len() > 1 {
             args.swap_remove(1)
         } else {
-            AgentValue::Unit
+            Value::Unit
         };
         call_tool(self.ctx.clone(), &tool_name, tool_args).await
     }

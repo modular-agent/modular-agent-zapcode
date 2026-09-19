@@ -1,7 +1,7 @@
 [package]
 name = "modular-agent-zapcode"
 version = "0.3.0"
-description = "ZapCode Agents for Modular Agent"
+description = "ZapCode Modules for Modular Agent"
 authors = ["Akira Ishino <akira@lumilab.jp>"]
 edition = "2024"
 license = "Apache-2.0 OR MIT"

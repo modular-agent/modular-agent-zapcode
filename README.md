@@ -1,10 +1,10 @@
-# ZapCode Agents for Modular Agent
+# ZapCode Modules for Modular Agent
 
 Execute sandboxed TypeScript-subset scripts in Modular Agent using [TheUncharted/zapcode](https://github.com/TheUncharted/zapcode), a Rust-native TypeScript interpreter. Scripts can call registered LLM tools, define new tools, and even declare whole custom nodes — all without filesystem, network, or environment access.
 
 ## Features
 
-- **ZC Expr** — Run TypeScript-like expressions and scripts to transform, filter, and reshape data in agent workflows
+- **ZC Expr** — Run TypeScript-like expressions and scripts to transform, filter, and reshape data in module workflows
 - **ZC Runner** — Execute LLM-generated code with access to registered tools (code-mode)
 - **ZC Tool** — Define an LLM tool whose implementation is a script
 - **ZC Script** — A generic node whose ports, configs, and behavior are declared by a script
@@ -30,7 +30,7 @@ Two changes to add this package to [`modular-agent-desktop`](https://github.com/
 
 Evaluates user-provided expressions and scripts through the ZapCode interpreter. Scripts receive input as the variable `value` and the value of the last expression becomes the output. Scripts are compiled fresh on each invocation; an empty script is a silent no-op.
 
-Scripts can call any registered tool with `await callTool(name, args)`; a failed tool call aborts the script with an error. `console.log` output is written to the application log, tagged with the agent id (output after the first `callTool` is not captured).
+Scripts can call any registered tool with `await callTool(name, args)`; a failed tool call aborts the script with an error. `console.log` output is written to the application log, tagged with the module id (output after the first `callTool` is not captured).
 
 ### Configuration
 
@@ -96,7 +96,7 @@ Every selected tool — including names that are not valid identifiers, such as 
 
 | Config | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| tools | text | "" | Newline-separated regex patterns selecting callable tools (same semantics as the LLM chat agents' `tools` config). Empty means the script can call no tools |
+| tools | text | "" | Newline-separated regex patterns selecting callable tools (same semantics as the LLM chat modules' `tools` config). Empty means the script can call no tools |
 | strip_fences | boolean | true | Unwrap a single Markdown code fence around the input |
 | time_limit_ms | integer | 5000 | Time limit for each stretch of script execution between tool calls |
 | memory_limit_mb | integer | 32 | Script memory limit in megabytes |
@@ -109,7 +109,7 @@ Every selected tool — including names that are not valid identifiers, such as 
 
 ### Self-Correction Flow
 
-Compile and runtime errors fail the run and flow out of the node's `err` port. Wiring that port back into the chat agent turns the ZC Runner into a self-correcting loop:
+Compile and runtime errors fail the run and flow out of the node's `err` port. Wiring that port back into the chat module turns the ZC Runner into a self-correcting loop:
 
 ```
 Chat (LLM) ──message──▶ ZC Runner ──value──▶ downstream / back to chat
@@ -117,14 +117,14 @@ Chat (LLM) ──message──▶ ZC Runner ──value──▶ downstream / ba
     └──────── err ──────────┘
 ```
 
-1. The chat agent is prompted to answer with a single ts-tagged code fence.
+1. The chat module is prompted to answer with a single ts-tagged code fence.
 2. The ZC Runner strips the fence and executes the code, dispatching tool calls.
-3. On failure, the error text (e.g. `ZapCode compile error: …`) flows from `err` back into the chat agent; the LLM sees its own error, fixes the code, and retries.
+3. On failure, the error text (e.g. `ZapCode compile error: …`) flows from `err` back into the chat module; the LLM sees its own error, fixes the code, and retries.
 4. On success, `value` carries the result onward.
 
 ## ZC Tool
 
-Defines an LLM tool implemented as a script. While the agent is running, the tool is registered under `name` so LLM agents whose `tools` patterns match it can call it.
+Defines an LLM tool implemented as a script. While the module is running, the tool is registered under `name` so LLM modules whose `tools` patterns match it can call it.
 
 On each call the tool's arguments are bound as script variables: every top-level argument becomes a variable of the same name, and the whole argument object is also available as `args` (the only way to reach arguments whose names are not valid identifiers). The value of the last expression is the tool result. Script errors are returned to the calling LLM as an error tool result, so the model sees the message and can retry.
 
@@ -136,7 +136,7 @@ Scripts can invoke other registered tools with `await callTool(name, args)`, com
 
 | Config | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| name | string | "" | Tool name; must match `^[a-zA-Z0-9_-]{1,64}$`. Empty uses the agent definition name |
+| name | string | "" | Tool name; must match `^[a-zA-Z0-9_-]{1,64}$`. Empty uses the module definition name |
 | description | text | "" | What the tool does and when to use it. Sent to the LLM — a detailed description materially improves tool selection |
 | parameters | object | {} | JSON Schema describing the tool's arguments |
 | script | text | "" | Script executed on each tool call |
@@ -160,10 +160,10 @@ a call with `{"a": 1, "b": 2}` returns `3`.
 
 ## ZC Script
 
-A generic node whose ports, configs, and behavior are defined by a script. The script declares the node's shape in a top-level `AGENT` object and implements its behavior in an `onInput(port, value)` function (the name `process` is reserved by the sandbox):
+A generic node whose ports, configs, and behavior are defined by a script. The script declares the node's shape in a top-level `MODULE` object and implements its behavior in an `onInput(port, value)` function (the name `process` is reserved by the sandbox):
 
 ```ts
-const AGENT = {
+const MODULE = {
   inputs: ["value", "reset"],          // default: ["value"]
   outputs: ["avg"],                    // default: ["value"]
   configs: {
@@ -180,7 +180,7 @@ function onInput(port, value) {
 }
 ```
 
-When the script changes, `AGENT` is re-evaluated (with no host functions and a short time budget, so top-level code must be free of side effects) and the node's ports and config fields update immediately. A broken script does not kill the node: it keeps its last valid ports and configs, and the error is reported. `name`, `title`, `category`, and `description` keys in `AGENT` are accepted and ignored. Declared config fields appear in the inspector sorted by name; their saved values survive patch save/reload.
+When the script changes, `MODULE` is re-evaluated (with no host functions and a short time budget, so top-level code must be free of side effects) and the node's ports and config fields update immediately. A broken script does not kill the node: it keeps its last valid ports and configs, and the error is reported. `name`, `title`, `category`, and `description` keys in `MODULE` are accepted and ignored. Declared config fields appear in the inspector sorted by name; their saved values survive patch save/reload.
 
 Inside `onInput` (plain or `async`), these host functions are available:
 
@@ -196,14 +196,14 @@ Inside `onInput` (plain or `async`), these host functions are available:
 
 | Config | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| script | text | "" | Script declaring the `AGENT` object and the `onInput` function. Script-declared configs appear as additional fields. An empty script leaves the node inert with the default ports |
+| script | text | "" | Script declaring the `MODULE` object and the `onInput` function. Script-declared configs appear as additional fields. An empty script leaves the node inert with the default ports |
 | time_limit_ms | integer | 5000 | Time limit for each stretch of script execution between host-function calls; it does not bound the total duration of an `onInput` run |
 | memory_limit_mb | integer | 32 | Memory budget for one `onInput` run in megabytes |
 
 ### Ports
 
-- **Input**: `value` — Default input port; replaced by the `inputs` declared in `AGENT`
-- **Output**: `value` — Default output port; replaced by the `outputs` declared in `AGENT`
+- **Input**: `value` — Default input port; replaced by the `inputs` declared in `MODULE`
+- **Output**: `value` — Default output port; replaced by the `outputs` declared in `MODULE`
 
 ### Usage Example
 
@@ -211,11 +211,11 @@ With the moving-average script above, sending `1`, `2`, `3` to `value` emits `1`
 
 ## Type Mapping
 
-All four agents share the same value bridge.
+All four modules share the same value bridge.
 
-**Input (AgentValue → ZapCode):**
+**Input (Value → ZapCode):**
 
-| AgentValue | ZapCode Type | Notes |
+| Value | ZapCode Type | Notes |
 | ---------- | ------------ | ----- |
 | Unit | null | Scripts never receive `undefined` as an input |
 | Boolean | boolean | |
@@ -229,9 +229,9 @@ All four agents share the same value bridge.
 | Error | string | Formatted error string |
 | Image | null | Image data is not accessible from scripts |
 
-**Output (ZapCode → AgentValue):**
+**Output (ZapCode → Value):**
 
-| ZapCode Type | AgentValue | Notes |
+| ZapCode Type | Value | Notes |
 | ------------ | ---------- | ----- |
 | undefined, null | Unit | Suppressed when `skip_unit` is true (ZC Expr) |
 | boolean | Boolean | |
@@ -242,7 +242,7 @@ All four agents share the same value bridge.
 | object | Object | Property order is not preserved |
 | function, generator, method | (error) | No data representation — the run fails with a hint that the last expression is the output ("did you forget to call the function?") |
 
-Note the asymmetry: `Unit` maps **in** as `null` only, but both `undefined` and `null` map **out** to `Unit`. A `Unit` that round-trips through a script comes back as `Unit` either way, but downstream agents cannot tell whether a script produced `undefined` or `null`.
+Note the asymmetry: `Unit` maps **in** as `null` only, but both `undefined` and `null` map **out** to `Unit`. A `Unit` that round-trips through a script comes back as `Unit` either way, but downstream modules cannot tell whether a script produced `undefined` or `null`.
 
 ## Limitations
 
@@ -251,20 +251,20 @@ ZapCode is a sandboxed interpreter for a subset of TypeScript — not Node, not 
 - Subset language: see the [zapcode repository](https://github.com/TheUncharted/zapcode) for supported features
 - The spread operator (`...`) is not implemented, and it fails silently: `[...xs, y]` produces the nested array `[xs, y]` instead of spreading (object spread and spread call arguments also misbehave). Use `xs.concat([y])` instead
 - No `import`, `require`, or `eval` — no module system and no dynamic code loading
-- No filesystem, network, or environment access; the only doors out of the sandbox are the host functions each agent declares (`callTool`, and for the ZC Script agent `emit` / `getConfig` / `getState` / `setState` / `log`)
+- No filesystem, network, or environment access; the only doors out of the sandbox are the host functions each module declares (`callTool`, and for the ZC Script module `emit` / `getConfig` / `getState` / `setState` / `log`)
 - Resource limits: execution stops with an error when the time limit (`time_limit_ms`, wall clock) or memory limit (`memory_limit_mb`) is exceeded. The time limit applies to each stretch of script execution between host calls, so it does not bound the total duration of a run that makes tool calls
 - `console.log` capture stops at the first tool call; later output is lost
 - Tool-from-tool recursion is not guarded (see ZC Tool)
 
 ## Error Handling
 
-- **Compile errors** (`ZapCode compile error: …`) and **runtime errors** (`ZapCode runtime error: …`) fail the agent's `process()` and flow out of the node's `err` port.
+- **Compile errors** (`ZapCode compile error: …`) and **runtime errors** (`ZapCode runtime error: …`) fail the module's `process()` and flow out of the node's `err` port.
 - **ZC Tool** is the exception: its script errors become error tool results, which are returned to the calling LLM instead of failing the flow.
 - A **failed tool call** inside a script (`callTool` or a direct tool function) aborts the script with the tool's error.
 
 ## Architecture
 
-Each run confines the VM to a single `spawn_blocking` closure. When the script calls a host function the VM suspends; the call is bridged over a channel to the async side, executed there (this is where tool calls `.await`), and the result resumes the VM. Only `AgentValue`s cross the thread boundary. Scripts are compiled fresh on each invocation (no bytecode cache).
+Each run confines the VM to a single `spawn_blocking` closure. When the script calls a host function the VM suspends; the call is bridged over a channel to the async side, executed there (this is where tool calls `.await`), and the result resumes the VM. Only `Value`s cross the thread boundary. Scripts are compiled fresh on each invocation (no bytecode cache).
 
 ## Key Dependencies
 

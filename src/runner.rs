@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use modular_agent_core::{
-    Agent, AgentContext, AgentData, AgentError, AgentOutput, AgentSpec, AgentValue, AgentValueMap,
-    AsAgent, ModularAgent, async_trait, modular_agent,
+    AsModule, Error, ModularAgent, Module, ModuleContext, ModuleData, ModuleOutput, ModuleSpec,
+    Result, Value, ValueMap, async_trait, modular_agent,
     tool::{call_tool, list_tool_infos_patterns},
 };
 use zapcode_core::ResourceLimits;
@@ -32,7 +32,7 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 /// with no filesystem, network, or environment access, and the value of its
 /// last expression becomes the `value` output. Compile and runtime errors fail
 /// the run and flow out of the error port; wiring that port back into a chat
-/// agent gives the LLM a chance to correct its own code.
+/// module gives the LLM a chance to correct its own code.
 ///
 /// Tools selected by the `tools` patterns are callable from the script. Each
 /// selected tool whose name is a valid identifier is available as a global
@@ -53,7 +53,7 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 ///
 /// # Configuration
 /// - `tools`: Newline-separated regular expressions selecting which registered
-///   tools the script may call (same semantics as the LLM chat agents'
+///   tools the script may call (same semantics as the LLM chat modules'
 ///   `tools` config). Empty means the script can call no tools
 /// - `strip_fences`: Unwrap a reply that is a single Markdown code fence
 ///   before executing it (default: true)
@@ -97,31 +97,26 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
         detail
     ),
 )]
-struct ZcRunnerAgent {
-    data: AgentData,
+struct ZcRunnerModule {
+    data: ModuleData,
 }
 
 #[async_trait]
-impl AsAgent for ZcRunnerAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for ZcRunnerModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
         })
     }
 
-    async fn process(
-        &mut self,
-        ctx: AgentContext,
-        _port: String,
-        value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, ctx: ModuleContext, _port: String, value: Value) -> Result<()> {
         let config = self.configs()?;
 
         let text = match &value {
-            AgentValue::String(s) => s.as_ref().clone(),
-            AgentValue::Message(m) => m.text(),
+            Value::String(s) => s.as_ref().clone(),
+            Value::Message(m) => m.text(),
             _ => {
-                return Err(AgentError::InvalidValue(
+                return Err(Error::InvalidValue(
                     "script input must be a string or a message".into(),
                 ));
             }
@@ -159,12 +154,8 @@ impl AsAgent for ZcRunnerAgent {
         let outcome = run_zapcode(source, vec![], externals, limits, &mut handler).await?;
 
         if !outcome.console.is_empty() {
-            self.output(
-                ctx.clone(),
-                PORT_CONSOLE,
-                AgentValue::string(outcome.console),
-            )
-            .await?;
+            self.output(ctx.clone(), PORT_CONSOLE, Value::string(outcome.console))
+                .await?;
         }
         self.output(ctx, PORT_VALUE, outcome.value).await
     }
@@ -174,28 +165,24 @@ impl AsAgent for ZcRunnerAgent {
 /// (`webSearch({…})`) and `callTool("name", {…})` converge on the same
 /// allowlist, so tools outside the `tools` patterns stay unreachable.
 struct ToolDispatcher {
-    ctx: AgentContext,
+    ctx: ModuleContext,
     allowed: BTreeSet<String>,
 }
 
 #[async_trait]
 impl ExternalHandler for ToolDispatcher {
-    async fn call(
-        &mut self,
-        name: String,
-        args: Vec<AgentValue>,
-    ) -> Result<AgentValue, AgentError> {
+    async fn call(&mut self, name: String, args: Vec<Value>) -> Result<Value> {
         let (tool_name, tool_args) = if name == EXTERNAL_CALL_TOOL {
             if args.len() > 2 {
-                return Err(AgentError::InvalidValue(
+                return Err(Error::InvalidValue(
                     "callTool takes a tool name and one arguments object".into(),
                 ));
             }
             let mut args = args.into_iter();
             let tool_name = match args.next() {
-                Some(AgentValue::String(s)) => s.as_ref().clone(),
+                Some(Value::String(s)) => s.as_ref().clone(),
                 _ => {
-                    return Err(AgentError::InvalidValue(
+                    return Err(Error::InvalidValue(
                         "callTool expects a tool name string as its first argument".into(),
                     ));
                 }
@@ -203,7 +190,7 @@ impl ExternalHandler for ToolDispatcher {
             (tool_name, args.next())
         } else {
             if args.len() > 1 {
-                return Err(AgentError::InvalidValue(format!(
+                return Err(Error::InvalidValue(format!(
                     "`{name}` takes a single arguments object"
                 )));
             }
@@ -211,11 +198,11 @@ impl ExternalHandler for ToolDispatcher {
         };
 
         if !self.allowed.contains(&tool_name) {
-            return Err(AgentError::InvalidValue(format!(
+            return Err(Error::InvalidValue(format!(
                 "tool `{tool_name}` does not match the tools config"
             )));
         }
-        let tool_args = tool_args.unwrap_or_else(|| AgentValue::Object(AgentValueMap::new()));
+        let tool_args = tool_args.unwrap_or_else(|| Value::Object(ValueMap::new()));
         call_tool(self.ctx.clone(), &tool_name, tool_args).await
     }
 }
@@ -224,14 +211,14 @@ impl ExternalHandler for ToolDispatcher {
 /// the set of tool names the dispatcher may call. `callTool` is always
 /// declared; matched tools are additionally exposed under their own name when
 /// it is a valid identifier.
-fn tool_externals(patterns: &str) -> Result<(Vec<String>, BTreeSet<String>), AgentError> {
+fn tool_externals(patterns: &str) -> Result<(Vec<String>, BTreeSet<String>)> {
     let mut externals = vec![EXTERNAL_CALL_TOOL.to_string()];
     let mut allowed = BTreeSet::new();
     if patterns.is_empty() {
         return Ok((externals, allowed));
     }
     let infos = list_tool_infos_patterns(patterns).map_err(|e| {
-        AgentError::InvalidConfig(format!("Invalid regex patterns in tools config: {e}"))
+        Error::InvalidConfig(format!("Invalid regex patterns in tools config: {e}"))
     })?;
     for info in infos {
         if !allowed.insert(info.name.clone()) {

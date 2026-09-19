@@ -1,6 +1,6 @@
 use modular_agent_core::{
-    Agent, AgentConfigs, AgentContext, AgentData, AgentError, AgentSpec, AgentStatus, AgentValue,
-    AsAgent, ModularAgent, async_trait, modular_agent,
+    AsModule, Error, ModularAgent, Module, ModuleConfigs, ModuleContext, ModuleData, ModuleSpec,
+    ModuleStatus, Result, Value, async_trait, modular_agent,
     tool::{Tool, ToolInfo, call_tool, register_tool, unregister_tool},
 };
 use zapcode_core::ResourceLimits;
@@ -24,8 +24,8 @@ static CALL_TOOL_FN: &str = "callTool";
 
 /// Defines an LLM tool implemented as a ZapCode (TypeScript subset) script.
 ///
-/// While the agent is running, the tool is registered under `name` so LLM
-/// agents whose `tools` patterns match it can call it. On each call the
+/// While the module is running, the tool is registered under `name` so LLM
+/// modules whose `tools` patterns match it can call it. On each call the
 /// tool's arguments are bound as script variables: every top-level argument
 /// becomes a variable of the same name, and the whole argument object is also
 /// available as `args` (the only way to reach arguments whose names are not
@@ -47,7 +47,7 @@ static CALL_TOOL_FN: &str = "callTool";
 ///
 /// # Configuration
 /// - `name`: Tool name; must match `^[a-zA-Z0-9_-]{1,64}$` (default: the
-///   agent definition name)
+///   module definition name)
 /// - `description`: What the tool does and when to use it. Sent to the LLM —
 ///   a detailed description (3-4+ sentences) materially improves tool
 ///   selection
@@ -72,14 +72,14 @@ static CALL_TOOL_FN: &str = "callTool";
     integer_config(name = CONFIG_MEMORY_LIMIT_MB, default = DEFAULT_MEMORY_LIMIT_MB, detail),
     hint(height = 2),
 )]
-struct ZcToolAgent {
-    data: AgentData,
+struct ZcToolModule {
+    data: ModuleData,
     name: String,
 }
 
-impl ZcToolAgent {
+impl ZcToolModule {
     /// Builds the tool from the current configs under the cached name.
-    fn build_tool(&self) -> Result<ZcScriptTool, AgentError> {
+    fn build_tool(&self) -> Result<ZcScriptTool> {
         let configs = self.configs()?;
         let description = configs.get_string_or_default(CONFIG_DESCRIPTION);
         let parameters = configs
@@ -95,8 +95,8 @@ impl ZcToolAgent {
 }
 
 #[async_trait]
-impl AsAgent for ZcToolAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for ZcToolModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         let name = spec
             .configs
             .as_ref()
@@ -104,12 +104,12 @@ impl AsAgent for ZcToolAgent {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| spec.def_name.clone());
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
             name,
         })
     }
 
-    fn configs_changed(&mut self) -> Result<(), AgentError> {
+    fn configs_changed(&mut self) -> Result<()> {
         let new_name = {
             let configs = self.configs()?;
             configs
@@ -122,7 +122,7 @@ impl AsAgent for ZcToolAgent {
 
         // Refresh the registration only while running; otherwise start() will
         // register the tool with the new values later.
-        if self.data.status == AgentStatus::Start {
+        if self.data.status == ModuleStatus::Start {
             warn_if_invalid_name(self.id(), &self.name);
             let tool = self.build_tool()?;
             refresh_registration(&old_name, tool);
@@ -131,7 +131,7 @@ impl AsAgent for ZcToolAgent {
         Ok(())
     }
 
-    async fn start(&mut self) -> Result<(), AgentError> {
+    async fn start(&mut self) -> Result<()> {
         // Claude and OpenAI both require tool names to match
         // ^[a-zA-Z0-9_-]{1,64}$; an invalid name only fails later at API-call
         // time, so surface it early.
@@ -141,17 +141,12 @@ impl AsAgent for ZcToolAgent {
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<(), AgentError> {
+    async fn stop(&mut self) -> Result<()> {
         unregister_tool(&self.name);
         Ok(())
     }
 
-    async fn process(
-        &mut self,
-        _ctx: AgentContext,
-        _port: String,
-        _value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, _ctx: ModuleContext, _port: String, _value: Value) -> Result<()> {
         Ok(())
     }
 }
@@ -170,7 +165,7 @@ fn refresh_registration(old_name: &str, tool: ZcScriptTool) {
 }
 
 /// Local copy of core's tool-name rule (`^[a-zA-Z0-9_-]{1,64}$`); core does
-/// not export it. Warn-only so a half-typed name never kills the agent.
+/// not export it. Warn-only so a half-typed name never kills the module.
 fn is_valid_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
@@ -181,7 +176,7 @@ fn is_valid_tool_name(name: &str) -> bool {
 fn warn_if_invalid_name(id: &str, name: &str) {
     if !is_valid_tool_name(name) {
         log::warn!(
-            "ZcToolAgent {} has invalid tool name {:?}; \
+            "ZcToolModule {} has invalid tool name {:?}; \
              tool names must match ^[a-zA-Z0-9_-]{{1,64}}$",
             id,
             name
@@ -189,7 +184,7 @@ fn warn_if_invalid_name(id: &str, name: &str) {
     }
 }
 
-fn limits_from_configs(configs: &AgentConfigs) -> ResourceLimits {
+fn limits_from_configs(configs: &ModuleConfigs) -> ResourceLimits {
     let mut limits = ResourceLimits {
         // Every VM push counts toward the default 100k allocation cap, which
         // would trip far below what the exposed time/memory budgets allow;
@@ -222,7 +217,7 @@ impl Tool for ZcScriptTool {
         &self.info
     }
 
-    async fn call(&self, ctx: AgentContext, args: AgentValue) -> Result<AgentValue, AgentError> {
+    async fn call(&self, ctx: ModuleContext, args: Value) -> Result<Value> {
         let inputs = bind_args(&args);
         let mut handler = ToolCallHandler { ctx };
         let outcome = run_zapcode(
@@ -247,9 +242,9 @@ impl Tool for ZcScriptTool {
 /// reachable only through `args`; a literal `args` argument wins over the
 /// whole-object binding because duplicate input names must not be passed to
 /// the VM.
-fn bind_args(args: &AgentValue) -> Vec<(String, AgentValue)> {
-    let mut inputs: Vec<(String, AgentValue)> = Vec::new();
-    if let AgentValue::Object(map) = args {
+fn bind_args(args: &Value) -> Vec<(String, Value)> {
+    let mut inputs: Vec<(String, Value)> = Vec::new();
+    if let Value::Object(map) = args {
         for (key, value) in map.iter() {
             if is_valid_identifier(key) {
                 inputs.push((key.clone(), value.clone()));
@@ -276,18 +271,14 @@ fn is_valid_identifier(name: &str) -> bool {
 /// Bridges the `callTool(name, args)` external function to the process-global
 /// tool registry.
 struct ToolCallHandler {
-    ctx: AgentContext,
+    ctx: ModuleContext,
 }
 
 #[async_trait]
 impl ExternalHandler for ToolCallHandler {
-    async fn call(
-        &mut self,
-        name: String,
-        args: Vec<AgentValue>,
-    ) -> Result<AgentValue, AgentError> {
+    async fn call(&mut self, name: String, args: Vec<Value>) -> Result<Value> {
         if name != CALL_TOOL_FN {
-            return Err(AgentError::InvalidValue(format!(
+            return Err(Error::InvalidValue(format!(
                 "ZapCode runtime error: external function `{name}` is not available here"
             )));
         }
@@ -296,11 +287,9 @@ impl ExternalHandler for ToolCallHandler {
             .next()
             .and_then(|v| v.as_str().map(str::to_string))
             .ok_or_else(|| {
-                AgentError::InvalidValue(
-                    "callTool: first argument must be a tool name string".into(),
-                )
+                Error::InvalidValue("callTool: first argument must be a tool name string".into())
             })?;
-        let tool_args = args.next().unwrap_or(AgentValue::Unit);
+        let tool_args = args.next().unwrap_or(Value::Unit);
         call_tool(self.ctx.clone(), &tool_name, tool_args).await
     }
 }
@@ -318,12 +307,12 @@ mod tests {
         }
     }
 
-    fn object_args(pairs: &[(&str, i64)]) -> AgentValue {
+    fn object_args(pairs: &[(&str, i64)]) -> Value {
         let mut map = im::HashMap::new();
         for (k, v) in pairs {
-            map.insert(k.to_string(), AgentValue::Integer(*v));
+            map.insert(k.to_string(), Value::Integer(*v));
         }
-        AgentValue::Object(map)
+        Value::Object(map)
     }
 
     // The tool registry is process-global, so every test uses unique names.
@@ -334,16 +323,16 @@ mod tests {
         register_tool(make_tool(name, "a + b"));
 
         let result = call_tool(
-            AgentContext::new(),
+            ModuleContext::new(),
             name,
             object_args(&[("a", 1), ("b", 2)]),
         )
         .await
         .unwrap();
-        assert!(matches!(result, AgentValue::Integer(3)));
+        assert!(matches!(result, Value::Integer(3)));
 
         unregister_tool(name);
-        let err = call_tool(AgentContext::new(), name, AgentValue::Unit)
+        let err = call_tool(ModuleContext::new(), name, Value::Unit)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -356,7 +345,7 @@ mod tests {
 
         // The Err lands in core's error_tool_result / is_error path, so the
         // calling LLM sees the message instead of the flow aborting.
-        let err = call_tool(AgentContext::new(), name, AgentValue::Unit)
+        let err = call_tool(ModuleContext::new(), name, Value::Unit)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("ZapCode runtime error"), "{err}");
@@ -369,10 +358,10 @@ mod tests {
         let name = "zapcode-tool-test-args";
         register_tool(make_tool(name, "args.x * 2"));
 
-        let result = call_tool(AgentContext::new(), name, object_args(&[("x", 21)]))
+        let result = call_tool(ModuleContext::new(), name, object_args(&[("x", 21)]))
             .await
             .unwrap();
-        assert!(matches!(result, AgentValue::Integer(42)));
+        assert!(matches!(result, Value::Integer(42)));
 
         unregister_tool(name);
     }
@@ -387,10 +376,10 @@ mod tests {
             "await callTool(\"zapcode-tool-test-compose-base\", {x: 41})",
         ));
 
-        let result = call_tool(AgentContext::new(), outer, AgentValue::Unit)
+        let result = call_tool(ModuleContext::new(), outer, Value::Unit)
             .await
             .unwrap();
-        assert!(matches!(result, AgentValue::Integer(42)));
+        assert!(matches!(result, Value::Integer(42)));
 
         unregister_tool(outer);
         unregister_tool(base);
@@ -406,10 +395,10 @@ mod tests {
         assert!(get_tool(old).is_none());
         assert!(get_tool(new).is_some());
 
-        let result = call_tool(AgentContext::new(), new, AgentValue::Unit)
+        let result = call_tool(ModuleContext::new(), new, Value::Unit)
             .await
             .unwrap();
-        assert!(matches!(result, AgentValue::Integer(2)));
+        assert!(matches!(result, Value::Integer(2)));
 
         unregister_tool(new);
     }

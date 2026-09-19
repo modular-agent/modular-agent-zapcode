@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
 use modular_agent_core::{
-    Agent, AgentConfigSpec, AgentConfigSpecs, AgentConfigs, AgentContext, AgentData, AgentError,
-    AgentOutput, AgentSpec, AgentValue, AsAgent, ModularAgent, async_trait, modular_agent,
+    AsModule, Error, ModularAgent, Module, ModuleConfigSpec, ModuleConfigSpecs, ModuleConfigs,
+    ModuleContext, ModuleData, ModuleOutput, ModuleSpec, Result, Value, async_trait, modular_agent,
     tool::call_tool,
 };
 use zapcode_core::{ResourceLimits, VmState, ZapcodeRun};
 
 use crate::bridge::{ExternalHandler, map_zapcode_error, run_zapcode};
-use crate::value::zapcode_to_agent_value;
+use crate::value::zapcode_to_value;
 
 static CATEGORY: &str = "Script/ZapCode";
 
@@ -18,7 +18,7 @@ static CONFIG_SCRIPT: &str = "script";
 static CONFIG_TIME_LIMIT_MS: &str = "time_limit_ms";
 static CONFIG_MEMORY_LIMIT_MB: &str = "memory_limit_mb";
 
-// Configs owned by the agent itself; a script may not declare these names.
+// Configs owned by the module itself; a script may not declare these names.
 static BASE_CONFIGS: &[&str] = &[CONFIG_SCRIPT, CONFIG_TIME_LIMIT_MS, CONFIG_MEMORY_LIMIT_MB];
 
 static EXTERNALS: &[&str] = &[
@@ -43,12 +43,12 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 /// Generic node whose ports, configs, and behavior are defined by a ZapCode
 /// (sandboxed TypeScript subset) script.
 ///
-/// The script declares the node's shape in a top-level `AGENT` object and
+/// The script declares the node's shape in a top-level `MODULE` object and
 /// implements its behavior in an `onInput(port, value)` function (the name
 /// `process` is reserved by the sandbox):
 ///
 /// ```ts
-/// const AGENT = {
+/// const MODULE = {
 ///   inputs: ["value", "reset"],          // default: ["value"]
 ///   outputs: ["avg"],                    // default: ["value"]
 ///   configs: {
@@ -65,12 +65,12 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 /// }
 /// ```
 ///
-/// When the script changes, `AGENT` is re-evaluated (with no host functions
+/// When the script changes, `MODULE` is re-evaluated (with no host functions
 /// and a short time budget, so top-level code must be free of side effects)
 /// and the node's ports and config fields update immediately. A broken script
 /// does not kill the node: it keeps its last valid ports and configs, and the
 /// error is reported. `name`, `title`, `category`, and `description` keys in
-/// `AGENT` are accepted and ignored. Declared config fields appear in the
+/// `MODULE` are accepted and ignored. Declared config fields appear in the
 /// inspector sorted by name.
 ///
 /// Each input triggers `onInput(port, value)`. Inside it, these host
@@ -89,11 +89,11 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
 /// `require`, and `eval` are unavailable.
 ///
 /// # Ports
-/// - Input `value`: Default input port; replaced by the `inputs` declared in `AGENT`.
-/// - Output `value`: Default output port; replaced by the `outputs` declared in `AGENT`.
+/// - Input `value`: Default input port; replaced by the `inputs` declared in `MODULE`.
+/// - Output `value`: Default output port; replaced by the `outputs` declared in `MODULE`.
 ///
 /// # Configuration
-/// - `script`: ZapCode script declaring the `AGENT` object and the `onInput` function.
+/// - `script`: ZapCode script declaring the `MODULE` object and the `onInput` function.
 ///   Script-declared configs appear as additional fields. An empty script leaves
 ///   the node inert with the default ports.
 /// - `time_limit_ms`: Time limit in milliseconds for each stretch of script
@@ -114,8 +114,8 @@ const DEFAULT_MEMORY_LIMIT_MB: i64 = 32;
     integer_config(name = CONFIG_TIME_LIMIT_MS, default = 5000, detail),
     integer_config(name = CONFIG_MEMORY_LIMIT_MB, default = 32, detail),
 )]
-struct ZcScriptAgent {
-    data: AgentData,
+struct ZcScriptModule {
+    data: ModuleData,
 
     // Outputs of the last successful describe; emit() validates against these.
     outputs: Vec<String>,
@@ -125,12 +125,12 @@ struct ZcScriptAgent {
     // when the script itself is still broken.
     valid_script: Option<String>,
 
-    state: HashMap<String, AgentValue>,
+    state: HashMap<String, Value>,
 }
 
 #[async_trait]
-impl AsAgent for ZcScriptAgent {
-    fn new(ma: ModularAgent, id: String, mut spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for ZcScriptModule {
+    fn new(ma: ModularAgent, id: String, mut spec: ModuleSpec) -> Result<Self> {
         let script = spec
             .configs
             .as_ref()
@@ -143,7 +143,7 @@ impl AsAgent for ZcScriptAgent {
             Ok(decl) => (decl.outputs, Some(script)),
             Err(e) => {
                 log::warn!("[{id}] ZC Script describe failed: {e}");
-                // AgentData::new strips every `_`-prefixed config, so the
+                // ModuleData::new strips every `_`-prefixed config, so the
                 // saved values of script-declared configs (renamed by
                 // reconcile_spec) would be gone for good once the user fixes
                 // the script. Rename them back so a later successful describe
@@ -159,14 +159,14 @@ impl AsAgent for ZcScriptAgent {
         };
 
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
             outputs,
             valid_script,
             state: HashMap::new(),
         })
     }
 
-    fn configs_changed(&mut self) -> Result<(), AgentError> {
+    fn configs_changed(&mut self) -> Result<()> {
         let script = self.configs()?.get_string_or_default(CONFIG_SCRIPT);
         if self.valid_script.as_deref() == Some(script.as_str()) {
             return Ok(());
@@ -178,16 +178,11 @@ impl AsAgent for ZcScriptAgent {
         let decl = describe_and_apply(&script, &mut self.data.spec)?;
         self.outputs = decl.outputs;
         self.valid_script = Some(script);
-        self.emit_agent_spec_updated();
+        self.emit_module_spec_updated();
         Ok(())
     }
 
-    async fn process(
-        &mut self,
-        ctx: AgentContext,
-        port: String,
-        value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, ctx: ModuleContext, port: String, value: Value) -> Result<()> {
         let (script, limits, configs) = {
             let config = self.configs()?;
             (
@@ -204,7 +199,7 @@ impl AsAgent for ZcScriptAgent {
         // is a no-op for a plain function, so both declarations work.
         let source = format!("{script}\nawait onInput({INPUT_PORT_VAR}, {INPUT_VALUE_VAR})");
         let inputs = vec![
-            (INPUT_PORT_VAR.to_string(), AgentValue::string(port)),
+            (INPUT_PORT_VAR.to_string(), Value::string(port)),
             (INPUT_VALUE_VAR.to_string(), value),
         ];
         let externals = EXTERNALS.iter().map(|s| s.to_string()).collect();
@@ -216,7 +211,7 @@ impl AsAgent for ZcScriptAgent {
         // fork guest and host views of the state.
         let mut handler = ProcessHandler {
             ctx: ctx.clone(),
-            agent_id: self.id().to_string(),
+            module_id: self.id().to_string(),
             configs,
             outputs: self.outputs.clone(),
             state: &mut self.state,
@@ -237,7 +232,7 @@ impl AsAgent for ZcScriptAgent {
     }
 }
 
-fn limits_from_configs(config: &AgentConfigs) -> ResourceLimits {
+fn limits_from_configs(config: &ModuleConfigs) -> ResourceLimits {
     let time_limit_ms = config
         .get_integer_or(CONFIG_TIME_LIMIT_MS, DEFAULT_TIME_LIMIT_MS)
         .max(1) as u64;
@@ -256,7 +251,7 @@ fn limits_from_configs(config: &AgentConfigs) -> ResourceLimits {
 }
 
 // ---------------------------------------------------------------------------
-// Describe path: evaluate `AGENT` and rebuild the spec from it
+// Describe path: evaluate `MODULE` and rebuild the spec from it
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -265,7 +260,7 @@ struct Declaration {
     outputs: Vec<String>,
     // Sorted by name: the Object -> im::HashMap conversion loses the script's
     // declaration order, so sorting is the only deterministic choice.
-    configs: Vec<(String, AgentConfigSpec)>,
+    configs: Vec<(String, ModuleConfigSpec)>,
 }
 
 impl Declaration {
@@ -281,7 +276,7 @@ impl Declaration {
 /// Moves `_`-prefixed config values (reconcile_spec's stale renames) back to
 /// their plain names. An existing plain-name value wins, matching the
 /// precedence `apply_declaration` uses when reading the fallback.
-fn restore_stale_configs(spec: &mut AgentSpec) {
+fn restore_stale_configs(spec: &mut ModuleSpec) {
     let Some(configs) = spec.configs.as_mut() else {
         return;
     };
@@ -300,15 +295,15 @@ fn restore_stale_configs(spec: &mut AgentSpec) {
     }
 }
 
-fn describe_and_apply(script: &str, spec: &mut AgentSpec) -> Result<Declaration, AgentError> {
+fn describe_and_apply(script: &str, spec: &mut ModuleSpec) -> Result<Declaration> {
     let decl = describe(script)?;
     apply_declaration(spec, &decl)?;
     Ok(decl)
 }
 
-/// Evaluates `script + "\nAGENT"` and parses the resulting declaration.
+/// Evaluates `script + "\nMODULE"` and parses the resulting declaration.
 /// An empty script declares nothing and yields the default ports.
-fn describe(script: &str) -> Result<Declaration, AgentError> {
+fn describe(script: &str) -> Result<Declaration> {
     if script.trim().is_empty() {
         return Ok(Declaration::default_ports());
     }
@@ -319,8 +314,8 @@ fn describe(script: &str) -> Result<Declaration, AgentError> {
 // Runs the VM inline: new()/configs_changed() are synchronous lifecycle hooks,
 // and with no external functions the run cannot suspend, so the async bridge
 // in runner.rs is unnecessary here.
-fn run_describe_script(script: &str) -> Result<AgentValue, AgentError> {
-    let source = format!("{script}\nAGENT");
+fn run_describe_script(script: &str) -> Result<Value> {
+    let source = format!("{script}\nMODULE");
     let limits = ResourceLimits {
         time_limit_ms: DESCRIBE_TIME_LIMIT_MS,
         ..ResourceLimits::default()
@@ -329,28 +324,26 @@ fn run_describe_script(script: &str) -> Result<AgentValue, AgentError> {
         ZapcodeRun::new(source, Vec::new(), Vec::new(), limits).map_err(map_zapcode_error)?;
     let result = runner.run(Vec::new()).map_err(map_zapcode_error)?;
     match result.state {
-        VmState::Complete(v) => zapcode_to_agent_value(v),
+        VmState::Complete(v) => zapcode_to_value(v),
         // Unreachable with no declared externals; calling an unknown function
         // is a runtime error, not a suspension.
-        VmState::Suspended { function_name, .. } => Err(AgentError::InvalidValue(format!(
+        VmState::Suspended { function_name, .. } => Err(Error::InvalidValue(format!(
             "ZapCode runtime error: external function `{function_name}` is not available \
-             while evaluating AGENT"
+             while evaluating MODULE"
         ))),
     }
 }
 
-fn parse_declaration(value: &AgentValue) -> Result<Declaration, AgentError> {
+fn parse_declaration(value: &Value) -> Result<Declaration> {
     // An unknown global evaluates to `undefined` rather than erroring, so a
     // script without a declaration lands here as Unit.
-    if matches!(value, AgentValue::Unit) {
-        return Err(AgentError::InvalidConfig(
-            "the script must declare a top-level AGENT object".to_string(),
+    if matches!(value, Value::Unit) {
+        return Err(Error::InvalidConfig(
+            "the script must declare a top-level MODULE object".to_string(),
         ));
     }
-    let AgentValue::Object(map) = value else {
-        return Err(AgentError::InvalidConfig(
-            "AGENT must be an object".to_string(),
-        ));
+    let Value::Object(map) = value else {
+        return Err(Error::InvalidConfig("MODULE must be an object".to_string()));
     };
 
     let inputs = parse_port_list(map.get("inputs"), "inputs")?;
@@ -358,12 +351,12 @@ fn parse_declaration(value: &AgentValue) -> Result<Declaration, AgentError> {
 
     let mut configs = Vec::new();
     if let Some(configs_value) = map.get("configs") {
-        let AgentValue::Object(config_map) = configs_value else {
-            return Err(AgentError::InvalidConfig(
-                "AGENT.configs must be an object".to_string(),
+        let Value::Object(config_map) = configs_value else {
+            return Err(Error::InvalidConfig(
+                "MODULE.configs must be an object".to_string(),
             ));
         };
-        let mut entries: Vec<(&String, &AgentValue)> = config_map.iter().collect();
+        let mut entries: Vec<(&String, &Value)> = config_map.iter().collect();
         entries.sort_by_key(|(name, _)| *name);
         for (name, entry) in entries {
             validate_config_name(name)?;
@@ -372,7 +365,7 @@ fn parse_declaration(value: &AgentValue) -> Result<Declaration, AgentError> {
     }
 
     // Remaining keys (name, title, category, description, api, ...) are
-    // accepted and ignored for compatibility with the file-based agent format.
+    // accepted and ignored for compatibility with the file-based module format.
     Ok(Declaration {
         inputs,
         outputs,
@@ -380,13 +373,13 @@ fn parse_declaration(value: &AgentValue) -> Result<Declaration, AgentError> {
     })
 }
 
-fn parse_port_list(value: Option<&AgentValue>, key: &str) -> Result<Vec<String>, AgentError> {
+fn parse_port_list(value: Option<&Value>, key: &str) -> Result<Vec<String>> {
     let Some(value) = value else {
         return Ok(vec![PORT_VALUE.to_string()]);
     };
-    let AgentValue::Array(items) = value else {
-        return Err(AgentError::InvalidConfig(format!(
-            "AGENT.{key} must be an array of strings"
+    let Value::Array(items) = value else {
+        return Err(Error::InvalidConfig(format!(
+            "MODULE.{key} must be an array of strings"
         )));
     };
     items
@@ -396,39 +389,39 @@ fn parse_port_list(value: Option<&AgentValue>, key: &str) -> Result<Vec<String>,
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| {
-                    AgentError::InvalidConfig(format!(
-                        "AGENT.{key} must be an array of non-empty strings"
+                    Error::InvalidConfig(format!(
+                        "MODULE.{key} must be an array of non-empty strings"
                     ))
                 })
         })
         .collect()
 }
 
-fn validate_config_name(name: &str) -> Result<(), AgentError> {
+fn validate_config_name(name: &str) -> Result<()> {
     if name.is_empty() || name.starts_with('_') {
-        return Err(AgentError::InvalidConfig(format!(
-            "AGENT.configs name `{name}` is invalid: it must be non-empty and must not \
+        return Err(Error::InvalidConfig(format!(
+            "MODULE.configs name `{name}` is invalid: it must be non-empty and must not \
              start with `_`"
         )));
     }
     if BASE_CONFIGS.contains(&name) {
-        return Err(AgentError::InvalidConfig(format!(
-            "AGENT.configs name `{name}` conflicts with a built-in config"
+        return Err(Error::InvalidConfig(format!(
+            "MODULE.configs name `{name}` conflicts with a built-in config"
         )));
     }
     Ok(())
 }
 
-fn parse_config_decl(name: &str, entry: &AgentValue) -> Result<AgentConfigSpec, AgentError> {
-    let AgentValue::Object(map) = entry else {
-        return Err(AgentError::InvalidConfig(format!(
-            "AGENT.configs.{name} must be an object"
+fn parse_config_decl(name: &str, entry: &Value) -> Result<ModuleConfigSpec> {
+    let Value::Object(map) = entry else {
+        return Err(Error::InvalidConfig(format!(
+            "MODULE.configs.{name} must be an object"
         )));
     };
 
     let declared_type = match map.get("type") {
         Some(t) => Some(t.as_str().map(str::to_string).ok_or_else(|| {
-            AgentError::InvalidConfig(format!("AGENT.configs.{name}.type must be a string"))
+            Error::InvalidConfig(format!("MODULE.configs.{name}.type must be a string"))
         })?),
         None => None,
     };
@@ -441,10 +434,10 @@ fn parse_config_decl(name: &str, entry: &AgentValue) -> Result<AgentConfigSpec, 
             (t, v)
         }
         (None, Some(v)) => (infer_type(&v).to_string(), v),
-        (None, None) => ("string".to_string(), AgentValue::string_default()),
+        (None, None) => ("string".to_string(), Value::string_default()),
     };
 
-    let mut config_spec = AgentConfigSpec::new(value, &type_);
+    let mut config_spec = ModuleConfigSpec::new(value, &type_);
     config_spec.title = map
         .get("title")
         .and_then(|t| t.as_str())
@@ -456,24 +449,24 @@ fn parse_config_decl(name: &str, entry: &AgentValue) -> Result<AgentConfigSpec, 
     Ok(config_spec)
 }
 
-fn default_for_type(type_: &str) -> AgentValue {
+fn default_for_type(type_: &str) -> Value {
     match type_ {
-        "integer" => AgentValue::integer(0),
-        "number" => AgentValue::number(0.0),
-        "boolean" => AgentValue::boolean(false),
-        "object" => AgentValue::object(im::HashMap::new()),
-        "array" => AgentValue::array(im::Vector::new()),
-        _ => AgentValue::string_default(),
+        "integer" => Value::integer(0),
+        "number" => Value::number(0.0),
+        "boolean" => Value::boolean(false),
+        "object" => Value::object(im::HashMap::new()),
+        "array" => Value::array(im::Vector::new()),
+        _ => Value::string_default(),
     }
 }
 
-fn infer_type(value: &AgentValue) -> &'static str {
+fn infer_type(value: &Value) -> &'static str {
     match value {
-        AgentValue::Boolean(_) => "boolean",
-        AgentValue::Integer(_) => "integer",
-        AgentValue::Number(_) => "number",
-        AgentValue::Object(_) => "object",
-        AgentValue::Array(_) => "array",
+        Value::Boolean(_) => "boolean",
+        Value::Integer(_) => "integer",
+        Value::Number(_) => "number",
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
         _ => "string",
     }
 }
@@ -482,32 +475,32 @@ fn infer_type(value: &AgentValue) -> &'static str {
 /// built-in configs and the stored values of script-declared configs.
 ///
 /// Mutates `spec` only after every fallible step, so an error leaves it intact.
-fn apply_declaration(spec: &mut AgentSpec, decl: &Declaration) -> Result<(), AgentError> {
-    let get_base_spec = |name: &str| -> Result<AgentConfigSpec, AgentError> {
+fn apply_declaration(spec: &mut ModuleSpec, decl: &Declaration) -> Result<()> {
+    let get_base_spec = |name: &str| -> Result<ModuleConfigSpec> {
         spec.config_specs
             .as_ref()
             .and_then(|cs| cs.get(name))
             .cloned()
-            .ok_or_else(|| AgentError::InvalidConfig(format!("config {name} must be present")))
+            .ok_or_else(|| Error::InvalidConfig(format!("config {name} must be present")))
     };
     let script_spec = get_base_spec(CONFIG_SCRIPT)?;
     let time_spec = get_base_spec(CONFIG_TIME_LIMIT_MS)?;
     let memory_spec = get_base_spec(CONFIG_MEMORY_LIMIT_MB)?;
 
     let old = spec.configs.clone().unwrap_or_default();
-    let mut configs = AgentConfigs::new();
-    let mut config_specs = AgentConfigSpecs::default();
+    let mut configs = ModuleConfigs::new();
+    let mut config_specs = ModuleConfigSpecs::default();
 
     // Order determines the inspector layout: script on top, declared fields
     // next, resource limits last (they carry the `detail` flag).
     configs.set(
         CONFIG_SCRIPT.to_string(),
-        AgentValue::string(old.get_string_or_default(CONFIG_SCRIPT)),
+        Value::string(old.get_string_or_default(CONFIG_SCRIPT)),
     );
     config_specs.insert(CONFIG_SCRIPT.to_string(), script_spec);
 
     for (name, config_spec) in &decl.configs {
-        // `AgentDefinition::reconcile_spec` moves configs the definition does
+        // `ModuleDefinition::reconcile_spec` moves configs the definition does
         // not declare - which includes every script-declared one - to a
         // `_`-prefixed key when a patch is loaded. Fall back to it so saved
         // values survive a reload.
@@ -530,7 +523,7 @@ fn apply_declaration(spec: &mut AgentSpec, decl: &Declaration) -> Result<(), Age
         let default = config_spec.value.as_i64().unwrap_or_default();
         configs.set(
             name.to_string(),
-            AgentValue::integer(old.get_integer_or(name, default)),
+            Value::integer(old.get_integer_or(name, default)),
         );
         config_specs.insert(name.to_string(), config_spec);
     }
@@ -547,75 +540,71 @@ fn apply_declaration(spec: &mut AgentSpec, decl: &Declaration) -> Result<(), Age
 // ---------------------------------------------------------------------------
 
 struct ProcessHandler<'a> {
-    ctx: AgentContext,
-    agent_id: String,
-    configs: AgentConfigs,
+    ctx: ModuleContext,
+    module_id: String,
+    configs: ModuleConfigs,
     outputs: Vec<String>,
-    state: &'a mut HashMap<String, AgentValue>,
-    emits: Vec<(String, AgentValue)>,
+    state: &'a mut HashMap<String, Value>,
+    emits: Vec<(String, Value)>,
 }
 
 impl ProcessHandler<'_> {
-    fn string_arg(args: &[AgentValue], index: usize, usage: &str) -> Result<String, AgentError> {
+    fn string_arg(args: &[Value], index: usize, usage: &str) -> Result<String> {
         args.get(index)
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .ok_or_else(|| AgentError::InvalidValue(format!("ZapCode runtime error: {usage}")))
+            .ok_or_else(|| Error::InvalidValue(format!("ZapCode runtime error: {usage}")))
     }
 
-    fn value_arg(args: &[AgentValue], index: usize) -> AgentValue {
-        args.get(index).cloned().unwrap_or(AgentValue::Unit)
+    fn value_arg(args: &[Value], index: usize) -> Value {
+        args.get(index).cloned().unwrap_or(Value::Unit)
     }
 }
 
 #[async_trait]
 impl ExternalHandler for ProcessHandler<'_> {
-    async fn call(
-        &mut self,
-        name: String,
-        args: Vec<AgentValue>,
-    ) -> Result<AgentValue, AgentError> {
+    async fn call(&mut self, name: String, args: Vec<Value>) -> Result<Value> {
         match name.as_str() {
             "emit" => {
                 let port = Self::string_arg(&args, 0, "emit expects (port, value)")?;
                 if !self.outputs.contains(&port) {
-                    return Err(AgentError::InvalidValue(format!(
+                    return Err(Error::InvalidValue(format!(
                         "ZapCode runtime error: emit to undeclared output port `{port}` \
                          (declared outputs: {})",
                         self.outputs.join(", ")
                     )));
                 }
                 self.emits.push((port, Self::value_arg(&args, 1)));
-                Ok(AgentValue::Unit)
+                Ok(Value::Unit)
             }
             "getConfig" => {
                 let key = Self::string_arg(&args, 0, "getConfig expects (name)")?;
-                Ok(self.configs.get(&key).cloned().unwrap_or(AgentValue::Unit))
+                Ok(self.configs.get(&key).cloned().unwrap_or(Value::Unit))
             }
             "getState" => {
                 let key = Self::string_arg(&args, 0, "getState expects (key)")?;
-                Ok(self.state.get(&key).cloned().unwrap_or(AgentValue::Unit))
+                Ok(self.state.get(&key).cloned().unwrap_or(Value::Unit))
             }
             "setState" => {
                 let key = Self::string_arg(&args, 0, "setState expects (key, value)")?;
                 self.state.insert(key, Self::value_arg(&args, 1));
-                Ok(AgentValue::Unit)
+                Ok(Value::Unit)
             }
             "log" => {
                 let message = match args.first() {
-                    Some(AgentValue::String(s)) => s.as_ref().clone(),
+                    Some(Value::String(s)) => s.as_ref().clone(),
                     Some(other) => other.to_json().to_string(),
                     None => String::new(),
                 };
-                log::info!("[{}] {message}", self.agent_id);
-                Ok(AgentValue::Unit)
+                log::info!("[{}] {message}", self.module_id);
+                Ok(Value::Unit)
             }
             "callTool" => {
                 let tool_name = Self::string_arg(&args, 0, "callTool expects (name, args)")?;
                 call_tool(self.ctx.clone(), &tool_name, Self::value_arg(&args, 1)).await
             }
             // Unreachable: the VM only suspends on functions in EXTERNALS.
-            other => Err(AgentError::InvalidValue(format!(
+            other => Err(Error::InvalidValue(format!(
                 "ZapCode runtime error: unknown external function `{other}`"
             ))),
         }
@@ -626,37 +615,37 @@ impl ExternalHandler for ProcessHandler<'_> {
 mod tests {
     use super::*;
 
-    fn base_config_specs() -> AgentConfigSpecs {
-        let mut specs = AgentConfigSpecs::default();
+    fn base_config_specs() -> ModuleConfigSpecs {
+        let mut specs = ModuleConfigSpecs::default();
         specs.insert(
             CONFIG_SCRIPT.to_string(),
-            AgentConfigSpec::new(AgentValue::string_default(), "text"),
+            ModuleConfigSpec::new(Value::string_default(), "text"),
         );
         specs.insert(
             CONFIG_TIME_LIMIT_MS.to_string(),
-            AgentConfigSpec::new(AgentValue::integer(DEFAULT_TIME_LIMIT_MS), "integer"),
+            ModuleConfigSpec::new(Value::integer(DEFAULT_TIME_LIMIT_MS), "integer"),
         );
         specs.insert(
             CONFIG_MEMORY_LIMIT_MB.to_string(),
-            AgentConfigSpec::new(AgentValue::integer(DEFAULT_MEMORY_LIMIT_MB), "integer"),
+            ModuleConfigSpec::new(Value::integer(DEFAULT_MEMORY_LIMIT_MB), "integer"),
         );
         specs
     }
 
-    fn spec_with_configs(configs: AgentConfigs) -> AgentSpec {
-        AgentSpec {
+    fn spec_with_configs(configs: ModuleConfigs) -> ModuleSpec {
+        ModuleSpec {
             id: "test".to_string(),
             def_name: "test_def".to_string(),
             inputs: Some(vec![PORT_VALUE.to_string()]),
             outputs: Some(vec![PORT_VALUE.to_string()]),
             configs: Some(configs),
             config_specs: Some(base_config_specs()),
-            ..AgentSpec::default()
+            ..ModuleSpec::default()
         }
     }
 
     static MOVING_AVERAGE_SCRIPT: &str = r#"
-const AGENT = {
+const MODULE = {
   inputs: ["value", "reset"],
   outputs: ["avg"],
   configs: {
@@ -667,7 +656,7 @@ const AGENT = {
 "#;
 
     #[test]
-    fn describe_extracts_agent_declaration() {
+    fn describe_extracts_module_declaration() {
         let decl = describe(MOVING_AVERAGE_SCRIPT).unwrap();
         assert_eq!(decl.inputs, vec!["value", "reset"]);
         assert_eq!(decl.outputs, vec!["avg"]);
@@ -675,14 +664,14 @@ const AGENT = {
         let (name, spec) = &decl.configs[0];
         assert_eq!(name, "window");
         assert_eq!(spec.type_.as_deref(), Some("integer"));
-        assert!(matches!(spec.value, AgentValue::Integer(5)));
+        assert!(matches!(spec.value, Value::Integer(5)));
         assert_eq!(spec.title.as_deref(), Some("Window"));
     }
 
     #[test]
     fn describe_defaults_when_keys_missing() {
         // name/title/category/description are accepted and ignored.
-        let decl = describe(r#"const AGENT = { api: 1, name: "x", title: "y" };"#).unwrap();
+        let decl = describe(r#"const MODULE = { api: 1, name: "x", title: "y" };"#).unwrap();
         assert_eq!(decl.inputs, vec![PORT_VALUE]);
         assert_eq!(decl.outputs, vec![PORT_VALUE]);
         assert!(decl.configs.is_empty());
@@ -701,20 +690,23 @@ const AGENT = {
         let err = describe("const = ;").unwrap_err();
         assert!(err.to_string().contains("ZapCode compile error"), "{err}");
 
-        // A script without an AGENT declaration is a describe failure too
+        // A script without an MODULE declaration is a describe failure too
         // (an unknown global evaluates to `undefined`, not a runtime error).
         let err = describe("const x = 1;").unwrap_err();
         assert!(err.to_string().contains("must declare"), "{err}");
 
-        let err = describe("const AGENT = 42;").unwrap_err();
-        assert!(err.to_string().contains("AGENT must be an object"), "{err}");
+        let err = describe("const MODULE = 42;").unwrap_err();
+        assert!(
+            err.to_string().contains("MODULE must be an object"),
+            "{err}"
+        );
     }
 
     #[test]
     fn failed_describe_leaves_spec_untouched() {
-        let mut configs = AgentConfigs::new();
-        configs.set(CONFIG_SCRIPT.to_string(), AgentValue::string("const = ;"));
-        configs.set("window".to_string(), AgentValue::integer(7));
+        let mut configs = ModuleConfigs::new();
+        configs.set(CONFIG_SCRIPT.to_string(), Value::string("const = ;"));
+        configs.set("window".to_string(), Value::integer(7));
         let mut spec = spec_with_configs(configs);
         // A previously valid shape that a broken re-describe must not disturb.
         spec.inputs = Some(vec!["value".to_string(), "reset".to_string()]);
@@ -725,7 +717,7 @@ const AGENT = {
         assert!(err.to_string().contains("ZapCode compile error"), "{err}");
         assert_eq!(serde_json::to_value(&spec).unwrap(), before);
 
-        // A script that runs but declares no AGENT fails after the VM run;
+        // A script that runs but declares no MODULE fails after the VM run;
         // the spec must survive that later failure too.
         let err = describe_and_apply("const x = 1;", &mut spec).unwrap_err();
         assert!(err.to_string().contains("must declare"), "{err}");
@@ -734,25 +726,19 @@ const AGENT = {
 
     #[test]
     fn restore_stale_configs_renames_back_without_clobbering() {
-        let mut configs = AgentConfigs::new();
-        configs.set("_window".to_string(), AgentValue::integer(7));
-        configs.set("kept".to_string(), AgentValue::integer(1));
-        configs.set("_kept".to_string(), AgentValue::integer(2));
+        let mut configs = ModuleConfigs::new();
+        configs.set("_window".to_string(), Value::integer(7));
+        configs.set("kept".to_string(), Value::integer(1));
+        configs.set("_kept".to_string(), Value::integer(2));
         let mut spec = spec_with_configs(configs);
 
         restore_stale_configs(&mut spec);
 
         let configs = spec.configs.as_ref().unwrap();
-        assert!(matches!(
-            configs.get("window").unwrap(),
-            AgentValue::Integer(7)
-        ));
+        assert!(matches!(configs.get("window").unwrap(), Value::Integer(7)));
         assert!(!configs.contains_key("_window"));
         // An existing plain-name value wins, matching apply_declaration.
-        assert!(matches!(
-            configs.get("kept").unwrap(),
-            AgentValue::Integer(1)
-        ));
+        assert!(matches!(configs.get("kept").unwrap(), Value::Integer(1)));
         assert!(!configs.contains_key("_kept"));
     }
 
@@ -762,7 +748,7 @@ const AGENT = {
     #[tokio::test]
     async fn doc_example_moving_average_emits_averages() {
         let script = r#"
-const AGENT = {
+const MODULE = {
   inputs: ["value", "reset"],
   outputs: ["avg"],
   configs: {
@@ -778,15 +764,15 @@ function onInput(port, value) {
   emit("avg", samples.reduce((a, b) => a + b) / samples.length);
 }
 "#;
-        let mut configs = AgentConfigs::new();
-        configs.set("window".to_string(), AgentValue::integer(5));
+        let mut configs = ModuleConfigs::new();
+        configs.set("window".to_string(), Value::integer(5));
         let mut state = HashMap::new();
         let mut handler = process_handler(&["avg"], configs, &mut state);
 
-        run_process(&mut handler, script, AgentValue::number(10.0))
+        run_process(&mut handler, script, Value::number(10.0))
             .await
             .unwrap();
-        run_process(&mut handler, script, AgentValue::number(20.0))
+        run_process(&mut handler, script, Value::number(20.0))
             .await
             .unwrap();
 
@@ -803,9 +789,10 @@ function onInput(port, value) {
 
     #[test]
     fn declared_configs_are_sorted_by_name() {
-        let decl =
-            describe(r#"const AGENT = { configs: { zebra: { value: 1 }, apple: { value: 2 } } };"#)
-                .unwrap();
+        let decl = describe(
+            r#"const MODULE = { configs: { zebra: { value: 1 }, apple: { value: 2 } } };"#,
+        )
+        .unwrap();
         let names: Vec<&str> = decl.configs.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["apple", "zebra"]);
     }
@@ -813,20 +800,20 @@ function onInput(port, value) {
     #[test]
     fn declared_config_name_may_not_shadow_builtin() {
         let err =
-            describe(r#"const AGENT = { configs: { script: { value: "x" } } };"#).unwrap_err();
+            describe(r#"const MODULE = { configs: { script: { value: "x" } } };"#).unwrap_err();
         assert!(err.to_string().contains("built-in config"), "{err}");
     }
 
     #[test]
     fn apply_declaration_rebuilds_spec_and_reads_stale_fallback() {
-        let mut configs = AgentConfigs::new();
+        let mut configs = ModuleConfigs::new();
         configs.set(
             CONFIG_SCRIPT.to_string(),
-            AgentValue::string(MOVING_AVERAGE_SCRIPT),
+            Value::string(MOVING_AVERAGE_SCRIPT),
         );
-        configs.set(CONFIG_TIME_LIMIT_MS.to_string(), AgentValue::integer(1234));
+        configs.set(CONFIG_TIME_LIMIT_MS.to_string(), Value::integer(1234));
         // Simulates reconcile_spec having renamed the saved `window` value.
-        configs.set("_window".to_string(), AgentValue::integer(7));
+        configs.set("_window".to_string(), Value::integer(7));
         let mut spec = spec_with_configs(configs);
 
         let decl = describe(MOVING_AVERAGE_SCRIPT).unwrap();
@@ -836,10 +823,7 @@ function onInput(port, value) {
         assert_eq!(spec.outputs.as_ref().unwrap(), &["avg"]);
 
         let configs = spec.configs.as_ref().unwrap();
-        assert!(matches!(
-            configs.get("window").unwrap(),
-            AgentValue::Integer(7)
-        ));
+        assert!(matches!(configs.get("window").unwrap(), Value::Integer(7)));
         assert!(!configs.contains_key("_window"));
         assert_eq!(configs.get_integer_or(CONFIG_TIME_LIMIT_MS, 0), 1234);
         assert_eq!(
@@ -866,9 +850,9 @@ function onInput(port, value) {
 
     #[test]
     fn apply_declaration_prefers_current_value_over_fallback() {
-        let mut configs = AgentConfigs::new();
-        configs.set("window".to_string(), AgentValue::integer(3));
-        configs.set("_window".to_string(), AgentValue::integer(7));
+        let mut configs = ModuleConfigs::new();
+        configs.set("window".to_string(), Value::integer(3));
+        configs.set("_window".to_string(), Value::integer(7));
         let mut spec = spec_with_configs(configs);
 
         let decl = describe(MOVING_AVERAGE_SCRIPT).unwrap();
@@ -876,29 +860,29 @@ function onInput(port, value) {
 
         assert!(matches!(
             spec.configs.as_ref().unwrap().get("window").unwrap(),
-            AgentValue::Integer(3)
+            Value::Integer(3)
         ));
     }
 
     #[test]
     fn apply_declaration_uses_declared_default_when_no_value_stored() {
-        let mut spec = spec_with_configs(AgentConfigs::new());
+        let mut spec = spec_with_configs(ModuleConfigs::new());
         let decl = describe(MOVING_AVERAGE_SCRIPT).unwrap();
         apply_declaration(&mut spec, &decl).unwrap();
         assert!(matches!(
             spec.configs.as_ref().unwrap().get("window").unwrap(),
-            AgentValue::Integer(5)
+            Value::Integer(5)
         ));
     }
 
     fn process_handler<'a>(
         outputs: &[&str],
-        configs: AgentConfigs,
-        state: &'a mut HashMap<String, AgentValue>,
+        configs: ModuleConfigs,
+        state: &'a mut HashMap<String, Value>,
     ) -> ProcessHandler<'a> {
         ProcessHandler {
-            ctx: AgentContext::new(),
-            agent_id: "test".to_string(),
+            ctx: ModuleContext::new(),
+            module_id: "test".to_string(),
             configs,
             outputs: outputs.iter().map(|s| s.to_string()).collect(),
             state,
@@ -909,13 +893,13 @@ function onInput(port, value) {
     async fn run_process(
         handler: &mut ProcessHandler<'_>,
         script: &str,
-        value: AgentValue,
-    ) -> Result<(), AgentError> {
+        value: Value,
+    ) -> Result<()> {
         let source = format!("{script}\nawait onInput({INPUT_PORT_VAR}, {INPUT_VALUE_VAR})");
         run_zapcode(
             source,
             vec![
-                (INPUT_PORT_VAR.to_string(), AgentValue::string("value")),
+                (INPUT_PORT_VAR.to_string(), Value::string("value")),
                 (INPUT_VALUE_VAR.to_string(), value),
             ],
             EXTERNALS.iter().map(|s| s.to_string()).collect(),
@@ -938,30 +922,30 @@ function onInput(port, value) {
     #[tokio::test]
     async fn process_collects_emits_and_keeps_state_across_runs() {
         let mut state = HashMap::new();
-        let mut handler = process_handler(&["sum"], AgentConfigs::new(), &mut state);
+        let mut handler = process_handler(&["sum"], ModuleConfigs::new(), &mut state);
 
-        run_process(&mut handler, SUM_SCRIPT, AgentValue::integer(2))
+        run_process(&mut handler, SUM_SCRIPT, Value::integer(2))
             .await
             .unwrap();
         assert!(matches!(
             handler.state.get("total"),
-            Some(AgentValue::Integer(2))
+            Some(Value::Integer(2))
         ));
 
         // Second run sees the state left by the first one.
-        run_process(&mut handler, SUM_SCRIPT, AgentValue::integer(3))
+        run_process(&mut handler, SUM_SCRIPT, Value::integer(3))
             .await
             .unwrap();
         assert_eq!(handler.emits.len(), 2);
         assert_eq!(handler.emits[0].0, "sum");
-        assert!(matches!(handler.emits[0].1, AgentValue::Integer(2)));
-        assert!(matches!(handler.emits[1].1, AgentValue::Integer(5)));
+        assert!(matches!(handler.emits[0].1, Value::Integer(2)));
+        assert!(matches!(handler.emits[1].1, Value::Integer(5)));
     }
 
     #[tokio::test]
     async fn process_reads_config_values() {
-        let mut configs = AgentConfigs::new();
-        configs.set("window".to_string(), AgentValue::integer(5));
+        let mut configs = ModuleConfigs::new();
+        configs.set("window".to_string(), Value::integer(5));
         let mut state = HashMap::new();
         let mut handler = process_handler(&["value"], configs, &mut state);
 
@@ -971,23 +955,23 @@ function onInput(port, value) {
   emit("value", getConfig("missing"));
 }
 "#;
-        run_process(&mut handler, script, AgentValue::Unit)
+        run_process(&mut handler, script, Value::Unit)
             .await
             .unwrap();
-        assert!(matches!(handler.emits[0].1, AgentValue::Integer(5)));
-        assert!(matches!(handler.emits[1].1, AgentValue::Unit));
+        assert!(matches!(handler.emits[0].1, Value::Integer(5)));
+        assert!(matches!(handler.emits[1].1, Value::Unit));
     }
 
     #[tokio::test]
     async fn emit_to_undeclared_port_errors() {
         let mut state = HashMap::new();
-        let mut handler = process_handler(&["sum"], AgentConfigs::new(), &mut state);
+        let mut handler = process_handler(&["sum"], ModuleConfigs::new(), &mut state);
         let script = r#"
 function onInput(port, value) {
   emit("nope", value);
 }
 "#;
-        let err = run_process(&mut handler, script, AgentValue::integer(1))
+        let err = run_process(&mut handler, script, Value::integer(1))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("undeclared output port"), "{err}");
